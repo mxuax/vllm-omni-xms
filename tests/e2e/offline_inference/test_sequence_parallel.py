@@ -11,11 +11,13 @@ short for CI.
 
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
 from PIL import Image
 
 # ruff: noqa: E402
@@ -52,17 +54,19 @@ def _diff_metrics(a: Image.Image, b: Image.Image) -> tuple[float, float]:
 
 
 @pytest.mark.parametrize("model_name", models)
-@pytest.mark.parametrize("ulysses_degree", [2])
-@pytest.mark.parametrize("ring_degree", [1])
+@pytest.mark.parametrize("ulysses_degree", [1, 2])
+@pytest.mark.parametrize("ring_degree", [1, 2])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_sequence_parallel(model_name: str, ulysses_degree: int, ring_degree: int, dtype: torch.dtype):
     """Compare baseline (ulysses_degree=1) vs SP (ulysses_degree>1) outputs."""
-    if ulysses_degree <= 1:
-        pytest.skip("This test compares ulysses_degree=1 vs ulysses_degree>1; provide ulysses_degree>1.")
+    if ulysses_degree <= 1 and ring_degree <= 1:
+        pytest.skip(
+            "This test compares ulysses_degree * ring_degree = 1 vs ulysses_degree * ring_degree > 1; provide ulysses_degree or ring_degree>1."
+        )
 
     # Skip if not enough GPUs available for SP run
-    if device_count() < ulysses_degree:
-        pytest.skip(f"Test requires {ulysses_degree} GPUs but only {device_count()} available")
+    if device_count() < ulysses_degree * ring_degree:
+        pytest.skip(f"Test requires {ulysses_degree * ring_degree} GPUs but only {device_count()} available")
 
     # Use minimal settings for fast testing
     height = 256
@@ -90,6 +94,11 @@ def test_sequence_parallel(model_name: str, ulysses_degree: int, ring_degree: in
         baseline_images = outputs[0].request_output[0]["images"]
     finally:
         baseline.close()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        for key in ["MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"]:
+            os.environ.pop(key, None)
+        time.sleep(5)  # Wait for resources to release
 
     assert baseline_images is not None
     assert len(baseline_images) == 1
@@ -134,7 +143,7 @@ def test_sequence_parallel(model_name: str, ulysses_degree: int, ring_degree: in
         max_threshold = 1e-1
 
     print(
-        "Image diff stats (baseline ulysses_degree=1 vs SP): "
+        "Image diff stats (baseline ulysses_degree*ring_degree=1 vs SP): "
         f"mean_abs_diff={mean_abs_diff:.6e}, max_abs_diff={max_abs_diff:.6e}; "
         f"thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e}; "
         f"ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, dtype={dtype}"
