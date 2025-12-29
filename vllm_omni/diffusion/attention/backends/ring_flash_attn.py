@@ -480,8 +480,8 @@ def ring_flash_attn_func(
             Defaults to "front".
 
     Returns:
-        Output tensor of shape (batch, seq_len, num_heads, head_dim).
-        If return_attn_probs=True, returns tuple of (output, softmax_lse, None).
+        Output tensor of shape (batch, seq_len, num_heads, head_dim), or tuple
+        of (output, softmax_lse, None) if return_attn_probs=True.
     """
     return RingFlashAttnFunc.apply(
         q,
