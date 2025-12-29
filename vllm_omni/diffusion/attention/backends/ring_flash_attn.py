@@ -480,7 +480,7 @@ def ring_flash_attn_func(
             Defaults to "front".
 
     Returns:
-        Output tensor (batch, seq_len, num_heads, head_dim) or tuple if return_attn_probs.
+        torch.Tensor: Output tensor (batch, seq_len, num_heads, head_dim).
     """
     return RingFlashAttnFunc.apply(
         q,
