@@ -3,6 +3,7 @@
 # Copyright (c) 2024, Jiarui Fang.
 # Adapted from https://github.com/feifeibear/long-context-attention
 
+from collections.abc import Callable
 from enum import Enum
 from functools import partial
 
@@ -53,7 +54,11 @@ class AttnType(Enum):
         raise ValueError(f"'{s}' is not a valid {cls.__name__}")
 
 
-def select_flash_attn_impl(impl_type: AttnType, stage: str = "fwd-only", attn_processor: torch.nn.Module = None):
+def select_flash_attn_impl(
+    impl_type: AttnType,
+    stage: str = "fwd-only",
+    attn_processor: torch.nn.Module | None = None,
+) -> Callable[..., tuple[torch.Tensor, torch.Tensor | None]]:
     """Select attention implementation for forward pass (inference only).
 
     Args:
@@ -62,7 +67,8 @@ def select_flash_attn_impl(impl_type: AttnType, stage: str = "fwd-only", attn_pr
         attn_processor: Optional custom attention processor.
 
     Returns:
-        The attention forward function for the specified implementation.
+        Callable[..., tuple[torch.Tensor, torch.Tensor | None]]: The attention
+            forward function for the specified implementation.
     """
     if stage != "fwd-only":
         raise ValueError(f"Only 'fwd-only' stage is supported for inference. Got: {stage}")
