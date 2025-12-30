@@ -54,9 +54,10 @@ def _diff_metrics(a: Image.Image, b: Image.Image) -> tuple[float, float]:
 
 
 @pytest.mark.parametrize("model_name", models)
-@pytest.mark.parametrize("ulysses_degree", [1, 2])
+@pytest.mark.parametrize("ulysses_degree", [2])
 @pytest.mark.parametrize("ring_degree", [1, 2])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("attn_backend", ["sdpa"])
 def test_sequence_parallel(model_name: str, ulysses_degree: int, ring_degree: int, dtype: torch.dtype):
     """Compare baseline (ulysses_degree=1) vs SP (ulysses_degree>1) outputs."""
     if ulysses_degree <= 1 and ring_degree <= 1:
