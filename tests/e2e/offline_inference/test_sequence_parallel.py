@@ -53,6 +53,14 @@ def _diff_metrics(a: Image.Image, b: Image.Image) -> tuple[float, float]:
     return abs_diff.mean().item(), abs_diff.max().item()
 
 
+def _get_images(output):
+    """Extract images from output, handling both dict and SimpleNamespace types."""
+    item = output.request_output[0]
+    if isinstance(item, dict):
+        return item.get("images")
+    return getattr(item, "images", None)
+
+
 @pytest.mark.parametrize("model_name", models)
 @pytest.mark.parametrize("ulysses_degree", [2])
 @pytest.mark.parametrize("ring_degree", [1, 2])
@@ -99,7 +107,7 @@ def test_sequence_parallel(
             generator=torch.Generator(get_device_name()).manual_seed(seed),
             num_outputs_per_prompt=1,
         )
-        baseline_images = outputs[0].request_output[0]["images"]
+        baseline_images = _get_images(outputs[0])
     finally:
         baseline.close()
         if dist.is_initialized():
@@ -131,7 +139,7 @@ def test_sequence_parallel(
             generator=torch.Generator(get_device_name()).manual_seed(seed),
             num_outputs_per_prompt=1,
         )
-        sp_images = outputs[0].request_output[0]["images"]
+        sp_images = _get_images(outputs[0])
     finally:
         sp.close()
 
