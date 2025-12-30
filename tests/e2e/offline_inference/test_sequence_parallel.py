@@ -58,7 +58,7 @@ def _get_images(output):
     # #region agent log
     import json
 
-    _log_path = r"c:\Users\xms01\Desktop\Pipefusion_DiT_vLLM_Omni\.cursor\debug.log"
+    _log_path = "/tmp/debug_get_images.log"
 
     def _dbg(msg, data, hyp):
         with open(_log_path, "a") as f:
@@ -153,8 +153,8 @@ def _get_images(output):
 
 
 @pytest.mark.parametrize("model_name", models)
-@pytest.mark.parametrize("ulysses_degree", [1])
-@pytest.mark.parametrize("ring_degree", [2])
+@pytest.mark.parametrize("ulysses_degree", [1, 2])
+@pytest.mark.parametrize("ring_degree", [1, 2])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("attn_backend", ["sdpa"])
 def test_sequence_parallel(
