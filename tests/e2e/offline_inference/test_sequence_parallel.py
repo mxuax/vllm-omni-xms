@@ -58,7 +58,13 @@ def _diff_metrics(a: Image.Image, b: Image.Image) -> tuple[float, float]:
 @pytest.mark.parametrize("ring_degree", [1, 2])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("attn_backend", ["sdpa"])
-def test_sequence_parallel(model_name: str, ulysses_degree: int, ring_degree: int, dtype: torch.dtype):
+def test_sequence_parallel(
+    model_name: str,
+    ulysses_degree: int,
+    ring_degree: int,
+    dtype: torch.dtype,
+    attn_backend: str,
+):
     """Compare baseline (ulysses_degree=1) vs SP (ulysses_degree>1) outputs."""
     if ulysses_degree <= 1 and ring_degree <= 1:
         pytest.skip(
@@ -81,6 +87,7 @@ def test_sequence_parallel(model_name: str, ulysses_degree: int, ring_degree: in
         model=model_name,
         parallel_config=baseline_parallel_config,
         dtype=dtype,
+        attention_backend=attn_backend,
     )
     try:
         outputs = baseline.generate(
@@ -92,7 +99,7 @@ def test_sequence_parallel(model_name: str, ulysses_degree: int, ring_degree: in
             generator=torch.Generator(get_device_name()).manual_seed(seed),
             num_outputs_per_prompt=1,
         )
-        baseline_images = outputs[0].request_output[0]["images"]
+        baseline_images = outputs[0].request_output[0].images
     finally:
         baseline.close()
         if dist.is_initialized():
@@ -112,6 +119,7 @@ def test_sequence_parallel(model_name: str, ulysses_degree: int, ring_degree: in
         model=model_name,
         parallel_config=sp_parallel_config,
         dtype=dtype,
+        attention_backend=attn_backend,
     )
     try:
         outputs = sp.generate(
@@ -123,7 +131,7 @@ def test_sequence_parallel(model_name: str, ulysses_degree: int, ring_degree: in
             generator=torch.Generator(get_device_name()).manual_seed(seed),
             num_outputs_per_prompt=1,
         )
-        sp_images = outputs[0].request_output[0]["images"]
+        sp_images = outputs[0].request_output[0].images
     finally:
         sp.close()
 
