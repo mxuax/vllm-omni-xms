@@ -54,101 +54,28 @@ def _diff_metrics(a: Image.Image, b: Image.Image) -> tuple[float, float]:
 
 
 def _get_images(output):
-    """Extract images from output, handling both dict and SimpleNamespace types."""
-    # #region agent log
-    import json
+    """Extract images from output, handling both dict and SimpleNamespace types.
 
-    _log_path = "/tmp/debug_get_images.log"
-
-    def _dbg(msg, data, hyp):
-        with open(_log_path, "a") as f:
-            f.write(
-                json.dumps(
-                    {
-                        "location": "test_sequence_parallel.py:_get_images",
-                        "message": msg,
-                        "data": data,
-                        "hypothesisId": hyp,
-                        "timestamp": __import__("time").time(),
-                    }
-                )
-                + "\n"
-            )
-
-    # #endregion
-
-    # #region agent log - H1: Check if request_output is None
-    _dbg(
-        "output type and request_output",
-        {
-            "output_type": type(output).__name__,
-            "request_output_is_none": output.request_output is None,
-            "has_images_attr": hasattr(output, "images"),
-        },
-        "H1",
-    )
-    # #endregion
-
-    # #region agent log - H3: Check if output has direct images attribute
+    The output structure varies depending on serialization path:
+    - Direct memory: SimpleNamespace with .images attribute
+    - SHM serialization: dict with "images" key (dataclass converted via asdict)
+    """
+    # Check if output has direct images attribute (diffusion mode)
     if hasattr(output, "images") and output.images:
-        _dbg("output has direct images", {"images_count": len(output.images) if output.images else 0}, "H3")
         return output.images
-    # #endregion
 
-    # #region agent log - H1/H2: Check request_output
+    # Check request_output for pipeline mode
     if output.request_output is None:
-        _dbg("request_output is None - returning None", {}, "H1")
         return None
-    # #endregion
 
-    # #region agent log - H2/H5: Check request_output type and length
-    _dbg(
-        "request_output info",
-        {
-            "type": type(output.request_output).__name__,
-            "is_list": isinstance(output.request_output, list),
-            "len": len(output.request_output) if hasattr(output.request_output, "__len__") else "N/A",
-        },
-        "H2",
-    )
-    # #endregion
-
-    # #region agent log - H5: Check if empty
     if isinstance(output.request_output, list) and len(output.request_output) == 0:
-        _dbg("request_output is empty list", {}, "H5")
         return None
-    # #endregion
 
     item = output.request_output[0]
 
-    # #region agent log - H4: Check item type and images
-    _dbg(
-        "item info",
-        {
-            "item_type": type(item).__name__,
-            "is_dict": isinstance(item, dict),
-            "has_images": "images" in item if isinstance(item, dict) else hasattr(item, "images"),
-        },
-        "H4",
-    )
-    # #endregion
-
+    # Handle both dict (from SHM serialization) and object (direct) types
     if isinstance(item, dict):
-        # #region agent log
-        _dbg(
-            "returning dict images",
-            {"images_value": str(item.get("images"))[:100] if item.get("images") else "None"},
-            "H4",
-        )
-        # #endregion
         return item.get("images")
-    # #region agent log
-    _dbg(
-        "returning attr images",
-        {"images_value": str(getattr(item, "images", None))[:100] if getattr(item, "images", None) else "None"},
-        "H4",
-    )
-    # #endregion
     return getattr(item, "images", None)
 
 
