@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) 2024, Jiarui Fang.
 # Adapted from https://github.com/feifeibear/long-context-attention
 
@@ -15,14 +16,10 @@ from .ring_globals import (
     HAS_SPARSE_SAGE_ATTENTION,
 )
 from .ring_kernels import (
-    flash_attn3_func_backward,
     flash_attn3_func_forward,
-    flash_attn_backward,
     flash_attn_forward,
     flash_attn_forward_aiter,
-    flashinfer_attn_backbward,
     flashinfer_attn_forward,
-    pytorch_attn_backward,
     pytorch_attn_forward,
 )
 
@@ -65,18 +62,12 @@ def select_flash_attn_impl(impl_type: AttnType, stage: str = "fwd-bwd", attn_pro
     if impl_type == AttnType.AITER:
         if stage == "fwd-only":
             return flash_attn_forward_aiter
-        elif stage == "bwd-only":
-            raise ValueError("Aiter does not support bwd-only stage.")
-        elif stage == "fwd-bwd":
-            raise ValueError("Aiter does not support fwd-bwd stage.")
         else:
             raise ValueError(f"Unknown stage: {stage}")
 
     elif impl_type == AttnType.FA:
         if stage == "fwd-only":
             return flash_attn_forward
-        elif stage == "bwd-only":
-            return flash_attn_backward
         elif stage == "fwd-bwd":
             assert HAS_FLASH_ATTN, "FlashAttention is not available"
             return flash_attn_func
@@ -86,8 +77,6 @@ def select_flash_attn_impl(impl_type: AttnType, stage: str = "fwd-bwd", attn_pro
     elif impl_type == AttnType.FA3:
         if stage == "fwd-only":
             return flash_attn3_func_forward
-        elif stage == "bwd-only":
-            return flash_attn3_func_backward
         elif stage == "fwd-bwd":
 
             def fn(
@@ -118,18 +107,12 @@ def select_flash_attn_impl(impl_type: AttnType, stage: str = "fwd-bwd", attn_pro
     elif impl_type == AttnType.FLASHINFER:
         if stage == "fwd-only":
             return flashinfer_attn_forward
-        elif stage == "bwd-only":
-            return flashinfer_attn_backbward
-        elif stage == "fwd-bwd":
-            raise ValueError("FlashInfer does not support fwd-bwd stage.")
         else:
             raise ValueError(f"Unknown stage: {stage}")
 
     elif impl_type == AttnType.TORCH:
         if stage == "fwd-only":
             return pytorch_attn_forward
-        elif stage == "bwd-only":
-            return pytorch_attn_backward
         elif stage == "fwd-bwd":
             from ..ring_pytorch_attn import pytorch_attn_func
 

@@ -24,7 +24,7 @@ if HAS_AITER:
 
 if HAS_FLASH_ATTN:
     import flash_attn
-    from flash_attn.flash_attn_interface import _flash_attn_backward, _flash_attn_forward
+    from flash_attn.flash_attn_interface import _flash_attn_forward
 
 if HAS_FLASH_ATTN_HOPPER:
     from flash_attn_interface import _flash_attn_backward as flash_attn_func_hopper_backward
@@ -101,33 +101,6 @@ def pytorch_attn_forward(
     return out, lse
 
 
-def pytorch_attn_backward(
-    doubt,
-    q,
-    k,
-    v,
-    out,
-    softmax_lse,
-    block_dq_buffer=None,  # Add new parameters with default values
-    block_dk_buffer=None,
-    block_dv_buffer=None,
-    dropout_p=0.0,
-    softmax_scale=None,
-    bwd_causal=None,  # This will replace the original causal parameter
-    window_size=None,
-    softcap=None,
-    alibi_slopes=None,
-    deterministic=True,
-    rng_state=None,
-    *args,
-    **kwargs,
-):
-    raise RuntimeError("Not implemented backward for AttnType.TORCH")
-    # TODO(optim): use pytorch _scaled_dot_product_efficient_attention_backward
-    # Use efficient attention backward
-    # https://github.com/pytorch/pytorch/blob/main/tools/autograd/derivatives.yaml#L2874
-
-
 def flash_attn_forward(
     q,
     k,
@@ -171,71 +144,6 @@ def flash_attn_forward(
             return_softmax=return_softmax,
         )
     return block_out, block_lse
-
-
-def flash_attn_backward(
-    doubt,
-    q,
-    k,
-    v,
-    out,
-    softmax_lse,
-    block_dq_buffer,
-    block_dk_buffer,
-    block_dv_buffer,
-    dropout_p,
-    softmax_scale,
-    bwd_causal,
-    window_size,
-    softcap,
-    alibi_slopes,
-    deterministic,
-    rng_state,
-):
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
-    assert HAS_FLASH_ATTN
-    if flash_attn.__version__ < "2.6.3":
-        _flash_attn_backward(
-            doubt,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            block_dq_buffer,
-            block_dk_buffer,
-            block_dv_buffer,
-            dropout_p,
-            softmax_scale,
-            bwd_causal,
-            window_size,
-            softcap,
-            alibi_slopes,
-            deterministic,
-            rng_state,
-        )
-    else:
-        _flash_attn_backward(
-            doubt,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            block_dq_buffer,
-            block_dk_buffer,
-            block_dv_buffer,
-            dropout_p,
-            softmax_scale,
-            bwd_causal,
-            window_size[0],  # Pass window_size_left
-            window_size[1],  # Pass window_size_right
-            softcap,
-            alibi_slopes,
-            deterministic,
-            rng_state,
-        )
 
 
 def flash_attn3_func_forward(
@@ -282,53 +190,6 @@ def flash_attn3_func_forward(
     )
 
     return out, softmax_lse
-
-
-def flash_attn3_func_backward(
-    doubt,
-    q,
-    k,
-    v,
-    out,
-    softmax_lse,
-    block_dq_buffer,
-    block_dk_buffer,
-    block_dv_buffer,
-    dropout_p,
-    softmax_scale,
-    bwd_causal,
-    window_size,
-    softcap,
-    alibi_slopes,
-    deterministic,
-    rng_state,
-):
-    # (doubt, q, k, v, out, softmax_lse, dq, dk, dv, softmax_scale, causal):
-    assert HAS_FLASH_ATTN_HOPPER, "FlashAttention Hopper is not available"
-
-    flash_attn_func_hopper_backward(
-        doubt,
-        q,
-        k,
-        v,
-        out,
-        softmax_lse,
-        cu_seqlens_q=None,
-        cu_seqlens_k=None,
-        sequed_q=None,
-        sequed_k=None,
-        max_seqlen_q=None,
-        max_seqlen_k=None,
-        dq=block_dq_buffer,
-        dk=block_dk_buffer,
-        dv=block_dv_buffer,
-        softmax_scale=softmax_scale,
-        causal=False,
-        window_size=(-1, -1),
-        softcap=0.0,
-        deterministic=False,
-        sm_margin=0,
-    )
 
 
 def flash_attn_forward_aiter(
@@ -403,21 +264,6 @@ def flashinfer_attn_forward(
         raise ValueError(f"Invalid input shape: {q.shape}")
     lse = lse / _LOG2_E
     return out, lse
-
-
-def flashinfer_attn_backbward(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    dropout_p: float = 0.0,
-    softmax_scale: float | None = None,
-    causal: bool = False,
-    window_size: tuple[int, int] = (-1, -1),
-    softcap: float | None = None,
-    alibi_slopes: torch.Tensor | None = None,
-    return_softmax: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    raise RuntimeError("Not implemented backward for AttnType.FLASHINFER")
 
 
 def npu_attn_forward(q, k, v, softmax_scale=None, layout="BSND"):

@@ -10,7 +10,6 @@ __all__ = ["update_out_and_lse", "flatten_varlen_lse", "unflatten_varlen_lse"]
 
 
 # Remove torch.jit.script for debugging and flexible shape handling
-# @torch.jit.script
 def _update_out_and_lse(
     out: torch.Tensor,
     lse: torch.Tensor,
@@ -156,7 +155,6 @@ def update_out_and_lse(
     return out, lse
 
 
-# @torch.jit.script
 def flatten_varlen_lse(lse, cu_seqlens):
     new_lse = []
     for i in range(len(cu_seqlens) - 1):
@@ -165,7 +163,6 @@ def flatten_varlen_lse(lse, cu_seqlens):
     return torch.cat(new_lse, dim=1)
 
 
-# @torch.jit.script
 def unflatten_varlen_lse(lse, cu_seqlens, max_seqlen: int):
     num_seq = len(cu_seqlens) - 1
     num_head = lse.shape[-2]
