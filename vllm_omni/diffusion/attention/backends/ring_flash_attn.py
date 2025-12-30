@@ -2,6 +2,7 @@
 # Copyright (c) 2024, Jiarui Fang.
 # Adapted from https://github.com/feifeibear/long-context-attention
 
+
 import torch
 
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType, select_flash_attn_impl
@@ -437,7 +438,7 @@ def ring_flash_attn_func(
     joint_tensor_key=None,
     joint_tensor_value=None,
     joint_strategy="front",
-):
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, None]:
     """Ring Attention forward pass using Flash Attention backend.
 
     Implements Ring Attention with sequence parallelism using a ring-based P2P
@@ -480,7 +481,9 @@ def ring_flash_attn_func(
             Defaults to "front".
 
     Returns:
-        torch.Tensor: Output tensor (batch, seq_len, num_heads, head_dim).
+        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, None]]:
+            - If return_attn_probs is False: Output tensor (batch, seq_len, num_heads, head_dim).
+            - If return_attn_probs is True: A tuple (out, softmax_lse, None).
     """
     return RingFlashAttnFunc.apply(
         q,
