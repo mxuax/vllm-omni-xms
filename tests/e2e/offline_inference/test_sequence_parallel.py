@@ -59,49 +59,49 @@ def _get_images(output):
     The output structure varies depending on serialization path:
     - Direct memory: SimpleNamespace with .images attribute
     - SHM serialization: dict with "images" key (dataclass converted via asdict)
+    - Wrapped output: SimpleNamespace(output=...) which needs unwrapping
     """
-    print(f"DEBUG: output type: {type(output)}")
+    import sys
+
+    print(f"DEBUG: Output ID: {output.request_id}, Finished: {output.finished}", file=sys.stderr)
+
     # Check if output has direct images attribute (diffusion mode)
     if hasattr(output, "images") and output.images:
-        print(f"DEBUG: Found direct images attr, len={len(output.images)}")
         return output.images
 
     # Check request_output for pipeline mode
     if output.request_output is None:
-        print("DEBUG: request_output is None")
+        print("DEBUG: output.request_output is None! Pipeline stage might have failed.", file=sys.stderr)
         return None
 
-    print(f"DEBUG: request_output type: {type(output.request_output)}")
-    if isinstance(output.request_output, list):
-        print(f"DEBUG: request_output len: {len(output.request_output)}")
-        if len(output.request_output) == 0:
-            return None
+    if isinstance(output.request_output, list) and len(output.request_output) == 0:
+        print("DEBUG: output.request_output is empty list!", file=sys.stderr)
+        return None
 
     item = output.request_output[0]
-    print(f"DEBUG: initial item type: {type(item)}")
 
-    # Handle potential SimpleNamespace wrapping (seen in omni_stage.py)
+    # Diagnose item structure
+    print(f"DEBUG: Item type: {type(item)}", file=sys.stderr)
+    if hasattr(item, "__dict__"):
+        print(f"DEBUG: Item vars: {vars(item)}", file=sys.stderr)
+    elif isinstance(item, dict):
+        print(f"DEBUG: Item keys: {list(item.keys())}", file=sys.stderr)
+
+    # Handle wrapped SimpleNamespace (e.g. from omni_stage.py)
     # Some items are wrapped as SimpleNamespace(request_id=..., output=...)
     while hasattr(item, "output") and not hasattr(item, "images"):
-        print(f"DEBUG: unwrapping item type {type(item)}, vars={vars(item)}")
         item = item.output
-        print(f"DEBUG: unwrapped to type {type(item)}")
-
-    print(f"DEBUG: final item type: {type(item)}")
+        if item is None:
+            print("DEBUG: Unwrapped item became None! Generation failed internally.", file=sys.stderr)
+            return None
+        print(f"DEBUG: Unwrapped to type: {type(item)}", file=sys.stderr)
+        if hasattr(item, "__dict__"):
+            print(f"DEBUG: Unwrapped item vars: {vars(item)}", file=sys.stderr)
 
     # Handle both dict (from SHM serialization) and object (direct) types
     if isinstance(item, dict):
-        images = item.get("images")
-        print(f"DEBUG: dict access images is None? {images is None}")
-        if images is None:
-            print(f"DEBUG: dict keys: {list(item.keys())}")
-        return images
-
-    images = getattr(item, "images", None)
-    print(f"DEBUG: attr access images is None? {images is None}")
-    if images is None and not isinstance(item, dict):
-        print(f"DEBUG: item vars: {vars(item)}")
-    return images
+        return item.get("images")
+    return getattr(item, "images", None)
 
 
 @pytest.mark.parametrize("model_name", models)
