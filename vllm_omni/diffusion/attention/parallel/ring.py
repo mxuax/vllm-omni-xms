@@ -137,7 +137,7 @@ class RingParallelAttention:
                 softmax_scale=softmax_scale,
                 causal=causal,
                 group=self._sp_group.ring_group,
-                op_type="flash",
+                op_type="efficient",
                 joint_tensor_key=joint_key,
                 joint_tensor_value=joint_value,
                 joint_strategy=joint_strategy,
