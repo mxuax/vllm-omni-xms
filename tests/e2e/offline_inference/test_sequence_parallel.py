@@ -78,7 +78,16 @@ def _get_images(output):
             return None
 
     item = output.request_output[0]
-    print(f"DEBUG: item type: {type(item)}")
+    print(f"DEBUG: initial item type: {type(item)}")
+
+    # Handle potential SimpleNamespace wrapping (seen in omni_stage.py)
+    # Some items are wrapped as SimpleNamespace(request_id=..., output=...)
+    while hasattr(item, "output") and not hasattr(item, "images"):
+        print(f"DEBUG: unwrapping item type {type(item)}, vars={vars(item)}")
+        item = item.output
+        print(f"DEBUG: unwrapped to type {type(item)}")
+
+    print(f"DEBUG: final item type: {type(item)}")
 
     # Handle both dict (from SHM serialization) and object (direct) types
     if isinstance(item, dict):
@@ -90,6 +99,8 @@ def _get_images(output):
 
     images = getattr(item, "images", None)
     print(f"DEBUG: attr access images is None? {images is None}")
+    if images is None and not isinstance(item, dict):
+        print(f"DEBUG: item vars: {vars(item)}")
     return images
 
 
