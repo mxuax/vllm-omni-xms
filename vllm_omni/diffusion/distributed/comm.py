@@ -241,11 +241,18 @@ class RingComm:
             self.recv_rank = dist.get_global_rank(self._process_group, self.recv_rank)
 
     def send_recv(self, to_send: torch.Tensor, recv_tensor: torch.Tensor | None = None) -> torch.Tensor:
+        # Ensure to_send is contiguous for P2P
+        if not to_send.is_contiguous():
+            to_send = to_send.contiguous()
+
         if recv_tensor is None:
-            res = torch.empty_like(to_send)
+            # Create a contiguous buffer for receiving
+            res = torch.empty_like(to_send, memory_format=torch.contiguous_format)
             # print(f"send_recv: empty_like {to_send.shape}")
         else:
             res = recv_tensor
+            if not res.is_contiguous():
+                res = res.contiguous()
 
         send_op = dist.P2POp(dist.isend, to_send, self.send_rank, group=self._process_group)
         recv_op = dist.P2POp(dist.irecv, res, self.recv_rank, group=self._process_group)

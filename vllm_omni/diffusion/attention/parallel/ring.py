@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+from vllm.logger import init_logger
 
 # import torch.distributed as dist # Not used directly here, but good practice if needed
 from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_FLASH_ATTN
@@ -117,6 +118,9 @@ class RingParallelAttention:
 
         # Fallback for FP32 or if Flash Attention is not available
         if query.dtype == torch.float32 or not HAS_FLASH_ATTN:
+            if not HAS_FLASH_ATTN and backend_pref != "sdpa":
+                logger = init_logger(__name__)
+                logger.warning("Flash Attention is not available! Force enabling SDPA.")
             backend_pref = "sdpa"
 
         # Extract joint tensors

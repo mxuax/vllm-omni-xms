@@ -185,6 +185,11 @@ def test_sequence_parallel(
         sp_images = _get_images(outputs[0])
     finally:
         sp.close()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        for key in ["MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"]:
+            os.environ.pop(key, None)
+        time.sleep(5)
 
     assert sp_images is not None
     assert len(sp_images) == 1

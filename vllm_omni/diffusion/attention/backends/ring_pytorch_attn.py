@@ -63,6 +63,11 @@ class RingAttentionFunc(torch.autograd.Function):
         joint_strategy="front",
     ):
         comm = RingComm(group)
+        # Ensure tensors are contiguous for P2P communication
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
         out, lse = None, None
         next_k, next_v = None, None
 
