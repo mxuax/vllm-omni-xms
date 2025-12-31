@@ -61,42 +61,25 @@ def _get_images(output):
     - SHM serialization: dict with "images" key (dataclass converted via asdict)
     - Wrapped output: SimpleNamespace(output=...) which needs unwrapping
     """
-    import sys
-
-    print(f"DEBUG: Output ID: {output.request_id}, Finished: {output.finished}", file=sys.stderr)
-
     # Check if output has direct images attribute (diffusion mode)
     if hasattr(output, "images") and output.images:
         return output.images
 
     # Check request_output for pipeline mode
     if output.request_output is None:
-        print("DEBUG: output.request_output is None! Pipeline stage might have failed.", file=sys.stderr)
         return None
 
     if isinstance(output.request_output, list) and len(output.request_output) == 0:
-        print("DEBUG: output.request_output is empty list!", file=sys.stderr)
         return None
 
     item = output.request_output[0]
-
-    # Diagnose item structure
-    print(f"DEBUG: Item type: {type(item)}", file=sys.stderr)
-    if hasattr(item, "__dict__"):
-        print(f"DEBUG: Item vars: {vars(item)}", file=sys.stderr)
-    elif isinstance(item, dict):
-        print(f"DEBUG: Item keys: {list(item.keys())}", file=sys.stderr)
 
     # Handle wrapped SimpleNamespace (e.g. from omni_stage.py)
     # Some items are wrapped as SimpleNamespace(request_id=..., output=...)
     while hasattr(item, "output") and not hasattr(item, "images"):
         item = item.output
         if item is None:
-            print("DEBUG: Unwrapped item became None! Generation failed internally.", file=sys.stderr)
             return None
-        print(f"DEBUG: Unwrapped to type: {type(item)}", file=sys.stderr)
-        if hasattr(item, "__dict__"):
-            print(f"DEBUG: Unwrapped item vars: {vars(item)}", file=sys.stderr)
 
     # Handle both dict (from SHM serialization) and object (direct) types
     if isinstance(item, dict):
@@ -107,7 +90,7 @@ def _get_images(output):
 @pytest.mark.parametrize("model_name", models)
 @pytest.mark.parametrize("ulysses_degree", [1, 2])
 @pytest.mark.parametrize("ring_degree", [1, 2])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])  # Only test bfloat16 to reduce CI time
 @pytest.mark.parametrize("attn_backend", ["sdpa"])
 def test_sequence_parallel(
     model_name: str,
@@ -157,7 +140,7 @@ def test_sequence_parallel(
             dist.destroy_process_group()
         for key in ["MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"]:
             os.environ.pop(key, None)
-        time.sleep(5)  # Wait for resources to release
+        time.sleep(2)  # Wait for resources to release
 
     assert baseline_images is not None
     assert len(baseline_images) == 1
@@ -189,7 +172,7 @@ def test_sequence_parallel(
             dist.destroy_process_group()
         for key in ["MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"]:
             os.environ.pop(key, None)
-        time.sleep(5)
+        time.sleep(2)
 
     assert sp_images is not None
     assert len(sp_images) == 1

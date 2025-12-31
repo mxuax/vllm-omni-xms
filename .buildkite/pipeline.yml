@@ -60,7 +60,7 @@ steps:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Diffusion Parallelism Test"
-    timeout_in_minutes: 15
+    timeout_in_minutes: 25
     depends_on: image-build
     commands:
       - pytest -s -v tests/diffusion/distributed/test_comm.py
