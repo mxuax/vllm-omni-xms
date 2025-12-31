@@ -9,6 +9,7 @@ import torch
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
 
@@ -17,7 +18,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         default="Qwen/Qwen-Image",
-        help="Diffusion model name or local path. Supported models: Qwen/Qwen-Image, Tongyi-MAI/Z-Image-Turbo",
+        help="Diffusion model name or local path. Supported models: "
+        "Qwen/Qwen-Image, Tongyi-MAI/Z-Image-Turbo, Qwen/Qwen-Image-2512",
     )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
     parser.add_argument("--seed", type=int, default=142, help="Random seed for deterministic results.")
@@ -149,8 +151,9 @@ def main():
     print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
 
     # Extract images from OmniRequestOutput
-    # omni.generate() returns list[OmniRequestOutput], extract images from the first output
-    if not outputs or len(outputs) == 0:
+    # omni.generate() returns Generator[OmniRequestOutput, None, None], convert to list
+    outputs = list(outputs)
+    if not outputs:
         raise ValueError("No output generated from omni.generate()")
     logger.info(f"Outputs: {outputs}")
 
@@ -160,10 +163,10 @@ def main():
         raise ValueError("No request_output found in OmniRequestOutput")
 
     req_out = first_output.request_output[0]
-    if not isinstance(req_out, dict) or "images" not in req_out:
+    if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
         raise ValueError("Invalid request_output structure or missing 'images' key")
 
-    images = req_out["images"]
+    images = req_out.images
     if not images:
         raise ValueError("No images found in request_output")
 
@@ -179,8 +182,6 @@ def main():
             save_path = output_path.parent / f"{stem}_{idx}{suffix}"
             img.save(save_path)
             print(f"Saved generated image to {save_path}")
-
-    omni.close()
 
 
 if __name__ == "__main__":
