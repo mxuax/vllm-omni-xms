@@ -60,23 +60,37 @@ def _get_images(output):
     - Direct memory: SimpleNamespace with .images attribute
     - SHM serialization: dict with "images" key (dataclass converted via asdict)
     """
+    print(f"DEBUG: output type: {type(output)}")
     # Check if output has direct images attribute (diffusion mode)
     if hasattr(output, "images") and output.images:
+        print(f"DEBUG: Found direct images attr, len={len(output.images)}")
         return output.images
 
     # Check request_output for pipeline mode
     if output.request_output is None:
+        print("DEBUG: request_output is None")
         return None
 
-    if isinstance(output.request_output, list) and len(output.request_output) == 0:
-        return None
+    print(f"DEBUG: request_output type: {type(output.request_output)}")
+    if isinstance(output.request_output, list):
+        print(f"DEBUG: request_output len: {len(output.request_output)}")
+        if len(output.request_output) == 0:
+            return None
 
     item = output.request_output[0]
+    print(f"DEBUG: item type: {type(item)}")
 
     # Handle both dict (from SHM serialization) and object (direct) types
     if isinstance(item, dict):
-        return item.get("images")
-    return getattr(item, "images", None)
+        images = item.get("images")
+        print(f"DEBUG: dict access images is None? {images is None}")
+        if images is None:
+            print(f"DEBUG: dict keys: {list(item.keys())}")
+        return images
+
+    images = getattr(item, "images", None)
+    print(f"DEBUG: attr access images is None? {images is None}")
+    return images
 
 
 @pytest.mark.parametrize("model_name", models)
