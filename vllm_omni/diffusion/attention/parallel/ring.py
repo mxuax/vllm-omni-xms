@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 
 # import torch.distributed as dist # Not used directly here, but good practice if needed
+from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_FLASH_ATTN
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType
 from vllm_omni.diffusion.attention.parallel.base import (
     ParallelAttentionContext,
@@ -114,8 +115,8 @@ class RingParallelAttention:
             except Exception:
                 backend_pref = None
 
-        # Fallback for FP32
-        if query.dtype == torch.float32:
+        # Fallback for FP32 or if Flash Attention is not available
+        if query.dtype == torch.float32 or not HAS_FLASH_ATTN:
             backend_pref = "sdpa"
 
         # Extract joint tensors
