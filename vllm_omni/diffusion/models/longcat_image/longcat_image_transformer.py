@@ -382,10 +382,13 @@ class LongCatImageSingleTransformerBlock(nn.Module):
         self.act_mlp = nn.GELU(approximate="tanh")
         self.proj_out = nn.Linear(dim + self.mlp_hidden_dim, dim)
 
-        # SP-aware attention with added_kv_proj for text embeddings
+        self.heads = num_attention_heads
+        self.head_dim = attention_head_dim
+
+        # Keep original model structure (no added_kv_proj_dim)
+        # SP is handled by manually splitting Q/K/V in forward
         self.attn = LongCatImageAttention(
             query_dim=dim,
-            added_kv_proj_dim=dim,
             dim_head=attention_head_dim,
             heads=num_attention_heads,
             out_dim=dim,
@@ -409,6 +412,17 @@ class LongCatImageSingleTransformerBlock(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass for SingleTransformerBlock with SP support.
+
+        In SP mode, we manually handle the QKV projection and split text/image
+        to use joint tensor mechanism correctly:
+        1. Concatenate text + image_chunk
+        2. Project to QKV using attn.to_qkv
+        3. Split QKV into text and image parts
+        4. Pass image QKV to attention with text as joint tensors
+        5. Combine outputs
+        """
         text_seq_len = encoder_hidden_states.shape[1]
 
         use_sp = (
@@ -417,46 +431,64 @@ class LongCatImageSingleTransformerBlock(nn.Module):
             and not get_forward_context().split_text_embed_in_sp
         )
 
+        # Concatenate text and image
+        # In SP mode: image is chunked (B, img_len/SP, D), text is full (B, txt_len, D)
+        combined = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        residual = combined
+        norm_hidden_states, gate = self.norm(combined, emb=temb)
+        mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
+
         if use_sp:
-            combined = torch.cat([encoder_hidden_states, hidden_states], dim=1)
-            residual = combined
-            norm_combined, gate = self.norm(combined, emb=temb)
-            norm_text = norm_combined[:, :text_seq_len]
-            norm_img = norm_combined[:, text_seq_len:]
+            # SP Mode: Manually handle QKV to use joint tensor mechanism
+            # Step 1: Project entire sequence using attn.to_qkv
+            qkv, _ = self.attn.to_qkv(norm_hidden_states)
+            query, key, value = qkv.chunk(3, dim=-1)
 
-            mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_combined))
+            # Reshape to multi-head format: (B, S, H, D)
+            query = query.unflatten(-1, (self.heads, -1))
+            key = key.unflatten(-1, (self.heads, -1))
+            value = value.unflatten(-1, (self.heads, -1))
 
-            joint_attention_kwargs = joint_attention_kwargs or {}
-            attn_output = self.attn(
-                hidden_states=norm_img,
-                encoder_hidden_states=norm_text,
-                image_rotary_emb=image_rotary_emb,
-                **joint_attention_kwargs,
+            # Apply RMSNorm
+            query = self.attn.norm_q(query)
+            key = self.attn.norm_k(key)
+
+            # Apply RoPE if provided
+            if image_rotary_emb is not None:
+                query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+                key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+            # Step 2: Split into text and image parts
+            # text_*: (B, txt_len, H, D)
+            # img_*: (B, img_len/SP, H, D)
+            text_query = query[:, :text_seq_len]
+            text_key = key[:, :text_seq_len]
+            text_value = value[:, :text_seq_len]
+            img_query = query[:, text_seq_len:]
+            img_key = key[:, text_seq_len:]
+            img_value = value[:, text_seq_len:]
+
+            # Step 3: Call underlying Attention with joint tensors
+            # Image Q/K/V will go through SP AllToAll/Ring
+            # Text Q/K/V will be handled as joint tensors (replicated)
+            attn_output = self.attn.attn(
+                img_query,
+                img_key,
+                img_value,
+                AttentionMetadata(
+                    joint_query=text_query,
+                    joint_key=text_key,
+                    joint_value=text_value,
+                    joint_strategy="front",
+                ),
             )
 
-            if isinstance(attn_output, tuple):
-                img_attn, text_attn = attn_output
-                attn_output = torch.cat([text_attn, img_attn], dim=1)
-
-            hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
-
-            gate = gate.unsqueeze(1)
-            hidden_states = gate * self.proj_out(hidden_states)
-
-            hidden_states = residual + hidden_states
-
-            if hidden_states.dtype == torch.float16:
-                hidden_states = hidden_states.clip(-65504, 65504)
-
-            encoder_hidden_states = hidden_states[:, :text_seq_len]
-            hidden_states = hidden_states[:, text_seq_len:]
-
+            # Step 4: Flatten and convert dtype
+            # Output: (B, txt_len + img_len/SP, H, D) -> (B, txt_len + img_len/SP, D)
+            attn_output = attn_output.flatten(2, 3)
+            attn_output = attn_output.to(query.dtype)
         else:
-            hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
-
-            residual = hidden_states
-            norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-            mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
+            # Non-SP Mode: Original path
             joint_attention_kwargs = joint_attention_kwargs or {}
             attn_output = self.attn(
                 hidden_states=norm_hidden_states,
@@ -464,17 +496,15 @@ class LongCatImageSingleTransformerBlock(nn.Module):
                 **joint_attention_kwargs,
             )
 
-            hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
-            gate = gate.unsqueeze(1)
-            hidden_states = gate * self.proj_out(hidden_states)
-            hidden_states = residual + hidden_states
+        hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
+        gate = gate.unsqueeze(1)
+        hidden_states = gate * self.proj_out(hidden_states)
+        hidden_states = residual + hidden_states
 
-            if hidden_states.dtype == torch.float16:
-                hidden_states = hidden_states.clip(-65504, 65504)
+        if hidden_states.dtype == torch.float16:
+            hidden_states = hidden_states.clip(-65504, 65504)
 
-            encoder_hidden_states = hidden_states[:, :text_seq_len]
-            hidden_states = hidden_states[:, text_seq_len:]
-
+        encoder_hidden_states, hidden_states = hidden_states[:, :text_seq_len], hidden_states[:, text_seq_len:]
         return encoder_hidden_states, hidden_states
 
 
