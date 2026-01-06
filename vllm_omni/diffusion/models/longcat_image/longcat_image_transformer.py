@@ -126,6 +126,22 @@ class LongCatImageAttention(nn.Module):
         image_rotary_emb: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        """
+        Forward pass with SP-aware joint attention.
+
+        Input shapes (in SP mode):
+            - hidden_states: (B, img_seq_len // SP, D) - image hidden states (chunked)
+            - encoder_hidden_states: (B, txt_seq_len, D) - text hidden states (full)
+
+        SP Mode (sequence_parallel_size > 1):
+            - Image Q/K/V: processed with AllToAll or Ring communication
+            - Text Q/K/V: passed as joint tensors, broadcasted to all ranks
+            - Output: attention over (text + image) with proper SP handling
+
+        Non-SP Mode (sequence_parallel_size = 1):
+            - Standard concatenation of text + image Q/K/V
+            - Regular attention over the full sequence
+        """
         qkv, _ = self.to_qkv(hidden_states)
 
         query, key, value = qkv.chunk(3, dim=-1)
@@ -150,6 +166,7 @@ class LongCatImageAttention(nn.Module):
             encoder_key = encoder_key.unflatten(-1, (self.heads, -1))
             encoder_value = encoder_value.unflatten(-1, (self.heads, -1))
 
+            # Apply RMSNorm to text Q/K
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
 
@@ -161,8 +178,13 @@ class LongCatImageAttention(nn.Module):
             )
 
             if use_sp_joint_attention:
-                # Use joint tensor mechanism for SP: pass text as joint Q/K/V
-                # This allows the SP attention layer to handle text correctly
+                # SP Mode: Use joint tensor mechanism
+                # - Image Q/K/V: (B, img_seq_len // SP, num_heads, head_dim) - will be AllToAll/Ring
+                # - Text Q/K/V: (B, txt_seq_len, num_heads, head_dim) - joint tensors, replicated
+                # The Attention layer internally handles:
+                #   1. AllToAll/Ring on image Q/K/V for SP communication
+                #   2. Prepending text K/V to each rank's image K/V
+                #   3. Computing attention: Q_img @ (K_txt + K_img), V_txt + V_img
                 hidden_states = self.attn(
                     query,
                     key,
@@ -175,7 +197,7 @@ class LongCatImageAttention(nn.Module):
                     ),
                 )
             else:
-                # Standard concatenation for non-SP mode
+                # Non-SP Mode: Standard concatenation
                 joint_query = torch.cat([encoder_query, query], dim=1)
                 joint_key = torch.cat([encoder_key, key], dim=1)
                 joint_value = torch.cat([encoder_value, value], dim=1)
@@ -191,11 +213,13 @@ class LongCatImageAttention(nn.Module):
                 key,
                 value,
             )
-
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
         if encoder_hidden_states is not None:
+            # Split output back into text and image portions
+            # In SP mode: seq_len = txt_seq_len + img_seq_len // SP
+            # In non-SP mode: seq_len = txt_seq_len + img_seq_len
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
                 [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
             )
@@ -339,17 +363,29 @@ class LongCatImageTimestepEmbeddings(nn.Module):
 
 
 class LongCatImageSingleTransformerBlock(nn.Module):
+    """
+    Single-stream Transformer block for LongCat with SP (Sequence Parallelism) support.
+
+    In SP mode, instead of concatenating text and image hidden states before attention,
+    we pass text as joint tensors through AttentionMetadata, allowing the attention layer
+    to handle the text correctly with AllToAll or Ring communication.
+    """
+
     def __init__(self, dim: int, num_attention_heads: int, attention_head_dim: int, mlp_ratio: float = 4.0):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
+        self.heads = num_attention_heads
+        self.head_dim = attention_head_dim
 
         self.norm = AdaLayerNormZeroSingle(dim)
         self.proj_mlp = nn.Linear(dim, self.mlp_hidden_dim)
         self.act_mlp = nn.GELU(approximate="tanh")
         self.proj_out = nn.Linear(dim + self.mlp_hidden_dim, dim)
 
+        # SP-aware attention with added_kv_proj for text embeddings
         self.attn = LongCatImageAttention(
             query_dim=dim,
+            added_kv_proj_dim=dim,
             dim_head=attention_head_dim,
             heads=num_attention_heads,
             out_dim=dim,
@@ -357,6 +393,13 @@ class LongCatImageSingleTransformerBlock(nn.Module):
             eps=1e-6,
             pre_only=True,
         )
+
+        # SP configuration
+        try:
+            config = get_current_omni_diffusion_config()
+            self.parallel_config = config.parallel_config
+        except Exception:
+            self.parallel_config = None
 
     def forward(
         self,
@@ -367,26 +410,71 @@ class LongCatImageSingleTransformerBlock(nn.Module):
         joint_attention_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         text_seq_len = encoder_hidden_states.shape[1]
-        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
-        residual = hidden_states
-        norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-        mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
-        joint_attention_kwargs = joint_attention_kwargs or {}
-        attn_output = self.attn(
-            hidden_states=norm_hidden_states,
-            image_rotary_emb=image_rotary_emb,
-            **joint_attention_kwargs,
+        use_sp = (
+            self.parallel_config is not None
+            and self.parallel_config.sequence_parallel_size > 1
+            and not get_forward_context().split_text_embed_in_sp
         )
 
-        hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
-        gate = gate.unsqueeze(1)
-        hidden_states = gate * self.proj_out(hidden_states)
-        hidden_states = residual + hidden_states
-        if hidden_states.dtype == torch.float16:
-            hidden_states = hidden_states.clip(-65504, 65504)
+        if use_sp:
+            combined = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+            residual = combined
+            norm_combined, gate = self.norm(combined, emb=temb)
+            norm_text = norm_combined[:, :text_seq_len]
+            norm_img = norm_combined[:, text_seq_len:]
 
-        encoder_hidden_states, hidden_states = hidden_states[:, :text_seq_len], hidden_states[:, text_seq_len:]
+            mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_combined))
+
+            joint_attention_kwargs = joint_attention_kwargs or {}
+            attn_output = self.attn(
+                hidden_states=norm_img,
+                encoder_hidden_states=norm_text,
+                image_rotary_emb=image_rotary_emb,
+                **joint_attention_kwargs,
+            )
+
+            if isinstance(attn_output, tuple):
+                img_attn, text_attn = attn_output
+                attn_output = torch.cat([text_attn, img_attn], dim=1)
+
+            hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
+
+            gate = gate.unsqueeze(1)
+            hidden_states = gate * self.proj_out(hidden_states)
+
+            hidden_states = residual + hidden_states
+
+            if hidden_states.dtype == torch.float16:
+                hidden_states = hidden_states.clip(-65504, 65504)
+
+            encoder_hidden_states = hidden_states[:, :text_seq_len]
+            hidden_states = hidden_states[:, text_seq_len:]
+
+        else:
+            hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+
+            residual = hidden_states
+            norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
+            mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
+            joint_attention_kwargs = joint_attention_kwargs or {}
+            attn_output = self.attn(
+                hidden_states=norm_hidden_states,
+                image_rotary_emb=image_rotary_emb,
+                **joint_attention_kwargs,
+            )
+
+            hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
+            gate = gate.unsqueeze(1)
+            hidden_states = gate * self.proj_out(hidden_states)
+            hidden_states = residual + hidden_states
+
+            if hidden_states.dtype == torch.float16:
+                hidden_states = hidden_states.clip(-65504, 65504)
+
+            encoder_hidden_states = hidden_states[:, :text_seq_len]
+            hidden_states = hidden_states[:, text_seq_len:]
+
         return encoder_hidden_states, hidden_states
 
 
@@ -519,11 +607,12 @@ class LongCatImageTransformer2DModel(nn.Module):
             total_start = time.perf_counter()
             embed_start = time.perf_counter()
 
-        # SP: Chunk hidden_states along sequence dimension
+        # Before: hidden_states shape = (B, img_seq_len, in_channels)
+        # After:  hidden_states shape = (B, img_seq_len // SP, in_channels)
         if self.parallel_config.sequence_parallel_size > 1:
-            hidden_states = torch.chunk(hidden_states, get_sequence_parallel_world_size(), dim=1)[
-                get_sequence_parallel_rank()
-            ]
+            sp_world_size = get_sequence_parallel_world_size()
+            sp_rank = get_sequence_parallel_rank()
+            hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
             # LongCat uses dual-stream (text + image) with joint attention
             # Text embeddings should be replicated across SP ranks for correctness
             get_forward_context().split_text_embed_in_sp = False
@@ -550,32 +639,32 @@ class LongCatImageTransformer2DModel(nn.Module):
 
         # SP: Chunk RoPE embeddings along sequence dimension
         if self.parallel_config.sequence_parallel_size > 1:
+            sp_world_size = get_sequence_parallel_world_size()
+            sp_rank = get_sequence_parallel_rank()
             freqs_cos, freqs_sin = image_rotary_emb
             txt_len = txt_ids.shape[0]
+
+            # Split RoPE into text and image portions
+            # txt_freqs: (txt_seq_len, head_dim) - keep full for all ranks
+            # img_freqs: (img_seq_len, head_dim) -> (img_seq_len // SP, head_dim)
+            txt_freqs_cos = freqs_cos[:txt_len]
+            txt_freqs_sin = freqs_sin[:txt_len]
             img_freqs_cos = freqs_cos[txt_len:]
             img_freqs_sin = freqs_sin[txt_len:]
 
             # Chunk image RoPE for each SP rank
-            img_freqs_cos = torch.chunk(img_freqs_cos, get_sequence_parallel_world_size(), dim=0)[
-                get_sequence_parallel_rank()
-            ]
-            img_freqs_sin = torch.chunk(img_freqs_sin, get_sequence_parallel_world_size(), dim=0)[
-                get_sequence_parallel_rank()
-            ]
+            # img_freqs_cos: (img_seq_len // SP, head_dim)
+            # img_freqs_sin: (img_seq_len // SP, head_dim)
+            img_freqs_cos = torch.chunk(img_freqs_cos, sp_world_size, dim=0)[sp_rank]
+            img_freqs_sin = torch.chunk(img_freqs_sin, sp_world_size, dim=0)[sp_rank]
 
-            # Keep text RoPE for all ranks (not split) if split_text_embed_in_sp is False
-            if not get_forward_context().split_text_embed_in_sp:
-                txt_freqs_cos = freqs_cos[:txt_len]
-                txt_freqs_sin = freqs_sin[:txt_len]
-            else:
-                txt_freqs_cos = torch.chunk(freqs_cos[:txt_len], get_sequence_parallel_world_size(), dim=0)[
-                    get_sequence_parallel_rank()
-                ]
-                txt_freqs_sin = torch.chunk(freqs_sin[:txt_len], get_sequence_parallel_world_size(), dim=0)[
-                    get_sequence_parallel_rank()
-                ]
+            # Optionally chunk text RoPE if split_text_embed_in_sp is True
+            if get_forward_context().split_text_embed_in_sp:
+                txt_freqs_cos = torch.chunk(txt_freqs_cos, sp_world_size, dim=0)[sp_rank]
+                txt_freqs_sin = torch.chunk(txt_freqs_sin, sp_world_size, dim=0)[sp_rank]
 
             # Reconstruct image_rotary_emb with chunked values
+            # Final shape: (txt_seq_len + img_seq_len // SP, head_dim)
             image_rotary_emb = (
                 torch.cat([txt_freqs_cos, img_freqs_cos], dim=0),
                 torch.cat([txt_freqs_sin, img_freqs_sin], dim=0),
