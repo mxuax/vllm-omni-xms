@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
 from collections.abc import Iterable
 from typing import Any
 
@@ -15,8 +16,15 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig, get_current_omni_diffusion_config
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_sequence_parallel_rank,
+    get_sequence_parallel_world_size,
+    get_sp_group,
+)
+from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.utils.platform_utils import is_npu
 
 logger = init_logger(__name__)
@@ -104,6 +112,13 @@ class LongCatImageAttention(nn.Module):
             causal=False,
         )
 
+        # SP configuration
+        try:
+            config = get_current_omni_diffusion_config()
+            self.parallel_config = config.parallel_config
+        except Exception:
+            self.parallel_config = None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -122,6 +137,11 @@ class LongCatImageAttention(nn.Module):
         query = self.norm_q(query)
         key = self.norm_k(key)
 
+        if image_rotary_emb is not None:
+            # Apply RoPE to image Q/K before concatenation
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
         if self.added_kv_proj_dim is not None:
             encoder_qkv, _ = self.add_kv_proj(encoder_hidden_states)
             encoder_query, encoder_key, encoder_value = encoder_qkv.chunk(3, dim=-1)
@@ -133,19 +153,45 @@ class LongCatImageAttention(nn.Module):
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
 
-            query = torch.cat([encoder_query, query], dim=1)
-            key = torch.cat([encoder_key, key], dim=1)
-            value = torch.cat([encoder_value, value], dim=1)
+            # Check if SP is enabled and not splitting text embed
+            use_sp_joint_attention = (
+                self.parallel_config is not None
+                and self.parallel_config.sequence_parallel_size > 1
+                and not get_forward_context().split_text_embed_in_sp
+            )
 
-        if image_rotary_emb is not None:
-            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
-            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+            if use_sp_joint_attention:
+                # Use joint tensor mechanism for SP: pass text as joint Q/K/V
+                # This allows the SP attention layer to handle text correctly
+                hidden_states = self.attn(
+                    query,
+                    key,
+                    value,
+                    AttentionMetadata(
+                        joint_query=encoder_query,
+                        joint_key=encoder_key,
+                        joint_value=encoder_value,
+                        joint_strategy="front",
+                    ),
+                )
+            else:
+                # Standard concatenation for non-SP mode
+                joint_query = torch.cat([encoder_query, query], dim=1)
+                joint_key = torch.cat([encoder_key, key], dim=1)
+                joint_value = torch.cat([encoder_value, value], dim=1)
 
-        hidden_states = self.attn(
-            query,
-            key,
-            value,
-        )
+                hidden_states = self.attn(
+                    joint_query,
+                    joint_key,
+                    joint_value,
+                )
+        else:
+            hidden_states = self.attn(
+                query,
+                key,
+                value,
+            )
+
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
@@ -347,6 +393,8 @@ class LongCatImageSingleTransformerBlock(nn.Module):
 class LongCatImageTransformer2DModel(nn.Module):
     """
     The Transformer model introduced in Flux.
+
+    Supports Sequence Parallelism (Ulysses and Ring) when configured via OmniDiffusionConfig.
     """
 
     def __init__(
@@ -366,6 +414,9 @@ class LongCatImageTransformer2DModel(nn.Module):
         self.out_channels = in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
         self.pooled_projection_dim = pooled_projection_dim
+
+        # Store parallel config for SP support
+        self.parallel_config = od_config.parallel_config
 
         self.pos_embed = LongCatImagePosEmbed(theta=10000, axes_dim=axes_dims_rope)
 
@@ -404,6 +455,55 @@ class LongCatImageTransformer2DModel(nn.Module):
         self.use_checkpoint = [True] * num_layers
         self.use_single_checkpoint = [True] * num_single_layers
 
+        # Timing statistics for profiling
+        self._timing_enabled = False
+        self._timing_stats = {
+            "embedding": [],
+            "rope": [],
+            "transformer_blocks": [],
+            "single_transformer_blocks": [],
+            "norm_out": [],
+            "total": [],
+        }
+
+    def enable_timing(self, enabled: bool = True):
+        """Enable or disable timing profiling."""
+        self._timing_enabled = enabled
+        if enabled:
+            # Reset timing stats
+            for key in self._timing_stats:
+                self._timing_stats[key] = []
+
+    def get_timing_stats(self) -> dict[str, dict[str, float]]:
+        """Get timing statistics as a dictionary with mean/std/min/max."""
+        import numpy as np
+
+        result = {}
+        for key, values in self._timing_stats.items():
+            if values:
+                arr = np.array(values)
+                result[key] = {
+                    "mean_ms": float(np.mean(arr) * 1000),
+                    "std_ms": float(np.std(arr) * 1000),
+                    "min_ms": float(np.min(arr) * 1000),
+                    "max_ms": float(np.max(arr) * 1000),
+                    "count": len(values),
+                }
+        return result
+
+    def print_timing_stats(self):
+        """Print timing statistics in a formatted way."""
+        stats = self.get_timing_stats()
+        logger.info("=" * 60)
+        logger.info("LongCatImageTransformer2DModel Timing Statistics")
+        logger.info("=" * 60)
+        for key, values in stats.items():
+            logger.info(
+                f"  {key:30s}: {values['mean_ms']:8.2f} ms (± {values['std_ms']:.2f}) "
+                f"[{values['min_ms']:.2f} - {values['max_ms']:.2f}] x{values['count']}"
+            )
+        logger.info("=" * 60)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -414,12 +514,31 @@ class LongCatImageTransformer2DModel(nn.Module):
         guidance: torch.Tensor = None,
         return_dict: bool = True,
     ) -> torch.FloatTensor | Transformer2DModelOutput:
+        if self._timing_enabled:
+            torch.cuda.synchronize()
+            total_start = time.perf_counter()
+            embed_start = time.perf_counter()
+
+        # SP: Chunk hidden_states along sequence dimension
+        if self.parallel_config.sequence_parallel_size > 1:
+            hidden_states = torch.chunk(hidden_states, get_sequence_parallel_world_size(), dim=1)[
+                get_sequence_parallel_rank()
+            ]
+            # LongCat uses dual-stream (text + image) with joint attention
+            # Text embeddings should be replicated across SP ranks for correctness
+            get_forward_context().split_text_embed_in_sp = False
+
         hidden_states = self.x_embedder(hidden_states)
 
         timestep = timestep.to(hidden_states.dtype) * 1000
 
         temb = self.time_embed(timestep, hidden_states.dtype)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
+
+        if self._timing_enabled:
+            torch.cuda.synchronize()
+            self._timing_stats["embedding"].append(time.perf_counter() - embed_start)
+            rope_start = time.perf_counter()
 
         ids = torch.cat((txt_ids, img_ids), dim=0)
 
@@ -428,6 +547,44 @@ class LongCatImageTransformer2DModel(nn.Module):
             image_rotary_emb = (freqs_cos.npu(), freqs_sin.npu())
         else:
             image_rotary_emb = self.pos_embed(ids)
+
+        # SP: Chunk RoPE embeddings along sequence dimension
+        if self.parallel_config.sequence_parallel_size > 1:
+            freqs_cos, freqs_sin = image_rotary_emb
+            txt_len = txt_ids.shape[0]
+            img_freqs_cos = freqs_cos[txt_len:]
+            img_freqs_sin = freqs_sin[txt_len:]
+
+            # Chunk image RoPE for each SP rank
+            img_freqs_cos = torch.chunk(img_freqs_cos, get_sequence_parallel_world_size(), dim=0)[
+                get_sequence_parallel_rank()
+            ]
+            img_freqs_sin = torch.chunk(img_freqs_sin, get_sequence_parallel_world_size(), dim=0)[
+                get_sequence_parallel_rank()
+            ]
+
+            # Keep text RoPE for all ranks (not split) if split_text_embed_in_sp is False
+            if not get_forward_context().split_text_embed_in_sp:
+                txt_freqs_cos = freqs_cos[:txt_len]
+                txt_freqs_sin = freqs_sin[:txt_len]
+            else:
+                txt_freqs_cos = torch.chunk(freqs_cos[:txt_len], get_sequence_parallel_world_size(), dim=0)[
+                    get_sequence_parallel_rank()
+                ]
+                txt_freqs_sin = torch.chunk(freqs_sin[:txt_len], get_sequence_parallel_world_size(), dim=0)[
+                    get_sequence_parallel_rank()
+                ]
+
+            # Reconstruct image_rotary_emb with chunked values
+            image_rotary_emb = (
+                torch.cat([txt_freqs_cos, img_freqs_cos], dim=0),
+                torch.cat([txt_freqs_sin, img_freqs_sin], dim=0),
+            )
+
+        if self._timing_enabled:
+            torch.cuda.synchronize()
+            self._timing_stats["rope"].append(time.perf_counter() - rope_start)
+            transformer_start = time.perf_counter()
 
         for index_block, block in enumerate(self.transformer_blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing and self.use_checkpoint[index_block]:
@@ -446,6 +603,11 @@ class LongCatImageTransformer2DModel(nn.Module):
                     image_rotary_emb=image_rotary_emb,
                 )
 
+        if self._timing_enabled:
+            torch.cuda.synchronize()
+            self._timing_stats["transformer_blocks"].append(time.perf_counter() - transformer_start)
+            single_start = time.perf_counter()
+
         for index_block, block in enumerate(self.single_transformer_blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing and self.use_single_checkpoint[index_block]:
                 encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
@@ -463,8 +625,25 @@ class LongCatImageTransformer2DModel(nn.Module):
                     image_rotary_emb=image_rotary_emb,
                 )
 
+        if self._timing_enabled:
+            torch.cuda.synchronize()
+            self._timing_stats["single_transformer_blocks"].append(time.perf_counter() - single_start)
+            norm_start = time.perf_counter()
+
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
+
+        if self._timing_enabled:
+            torch.cuda.synchronize()
+            self._timing_stats["norm_out"].append(time.perf_counter() - norm_start)
+
+        # SP: All-gather output to reconstruct full sequence
+        if self.parallel_config.sequence_parallel_size > 1:
+            output = get_sp_group().all_gather(output, dim=1)
+
+        if self._timing_enabled:
+            torch.cuda.synchronize()
+            self._timing_stats["total"].append(time.perf_counter() - total_start)
 
         if not return_dict:
             return (output,)
