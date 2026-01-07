@@ -112,13 +112,6 @@ class LongCatImageAttention(nn.Module):
             causal=False,
         )
 
-        # SP configuration
-        try:
-            config = get_current_omni_diffusion_config()
-            self.parallel_config = config.parallel_config
-        except Exception:
-            self.parallel_config = None
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -170,12 +163,18 @@ class LongCatImageAttention(nn.Module):
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
 
-            # Check if SP is enabled and not splitting text embed
-            use_sp_joint_attention = (
-                self.parallel_config is not None
-                and self.parallel_config.sequence_parallel_size > 1
-                and not get_forward_context().split_text_embed_in_sp
-            )
+            # Check if SP is enabled dynamically (config may not be available at __init__ time)
+            use_sp_joint_attention = False
+            try:
+                config = get_current_omni_diffusion_config()
+                parallel_config = config.parallel_config
+                use_sp_joint_attention = (
+                    parallel_config is not None
+                    and parallel_config.sequence_parallel_size > 1
+                    and not get_forward_context().split_text_embed_in_sp
+                )
+            except Exception:
+                pass
 
             if use_sp_joint_attention:
                 # SP Mode: Use joint tensor mechanism
@@ -397,13 +396,6 @@ class LongCatImageSingleTransformerBlock(nn.Module):
             pre_only=True,
         )
 
-        # SP configuration
-        try:
-            config = get_current_omni_diffusion_config()
-            self.parallel_config = config.parallel_config
-        except Exception:
-            self.parallel_config = None
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -425,11 +417,29 @@ class LongCatImageSingleTransformerBlock(nn.Module):
         """
         text_seq_len = encoder_hidden_states.shape[1]
 
-        use_sp = (
-            self.parallel_config is not None
-            and self.parallel_config.sequence_parallel_size > 1
-            and not get_forward_context().split_text_embed_in_sp
-        )
+        # Get SP config dynamically at forward time (not __init__ time)
+        # because config may not be set during model initialization
+        use_sp = False
+        try:
+            config = get_current_omni_diffusion_config()
+            parallel_config = config.parallel_config
+            use_sp = (
+                parallel_config is not None
+                and parallel_config.sequence_parallel_size > 1
+                and not get_forward_context().split_text_embed_in_sp
+            )
+            # Debug: Log SP status (only once per forward)
+            if not hasattr(self, "_sp_logged"):
+                self._sp_logged = True
+                logger.info(
+                    f"[SingleTransformerBlock] SP config: use_sp={use_sp}, "
+                    f"sp_size={parallel_config.sequence_parallel_size if parallel_config else 'N/A'}, "
+                    f"img_shape={hidden_states.shape}, txt_shape={encoder_hidden_states.shape}"
+                )
+        except Exception as e:
+            if not hasattr(self, "_sp_logged"):
+                self._sp_logged = True
+                logger.warning(f"[SingleTransformerBlock] Failed to get SP config: {e}")
 
         # Concatenate text and image
         # In SP mode: image is chunked (B, img_len/SP, D), text is full (B, txt_len, D)
@@ -639,13 +649,26 @@ class LongCatImageTransformer2DModel(nn.Module):
 
         # Before: hidden_states shape = (B, img_seq_len, in_channels)
         # After:  hidden_states shape = (B, img_seq_len // SP, in_channels)
-        if self.parallel_config.sequence_parallel_size > 1:
+        sp_size = self.parallel_config.sequence_parallel_size
+        if sp_size > 1:
             sp_world_size = get_sequence_parallel_world_size()
             sp_rank = get_sequence_parallel_rank()
+            original_shape = hidden_states.shape
             hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
             # LongCat uses dual-stream (text + image) with joint attention
             # Text embeddings should be replicated across SP ranks for correctness
             get_forward_context().split_text_embed_in_sp = False
+            # Debug log (only first forward)
+            if not hasattr(self, "_sp_forward_logged"):
+                self._sp_forward_logged = True
+                logger.info(
+                    f"[LongCat Transformer] SP enabled: sp_size={sp_size}, world_size={sp_world_size}, "
+                    f"rank={sp_rank}, original_shape={original_shape}, chunked_shape={hidden_states.shape}"
+                )
+        else:
+            if not hasattr(self, "_sp_forward_logged"):
+                self._sp_forward_logged = True
+                logger.info(f"[LongCat Transformer] SP disabled: sp_size={sp_size}")
 
         hidden_states = self.x_embedder(hidden_states)
 
