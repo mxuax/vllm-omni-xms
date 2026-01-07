@@ -146,11 +146,6 @@ class LongCatImageAttention(nn.Module):
         query = self.norm_q(query)
         key = self.norm_k(key)
 
-        if image_rotary_emb is not None:
-            # Apply RoPE to image Q/K before concatenation
-            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
-            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
-
         if self.added_kv_proj_dim is not None:
             encoder_qkv, _ = self.add_kv_proj(encoder_hidden_states)
             encoder_query, encoder_key, encoder_value = encoder_qkv.chunk(3, dim=-1)
@@ -177,6 +172,21 @@ class LongCatImageAttention(nn.Module):
                 pass
 
             if use_sp_joint_attention:
+                # SP Mode: Apply RoPE separately to text and image Q/K
+                # image_rotary_emb contains [txt_pos, img_pos], need to split
+                if image_rotary_emb is not None:
+                    freqs_cos, freqs_sin = image_rotary_emb
+                    txt_seq_len = encoder_query.shape[1]
+                    # Split RoPE: text portion and image portion
+                    txt_rotary_emb = (freqs_cos[:txt_seq_len], freqs_sin[:txt_seq_len])
+                    img_rotary_emb = (freqs_cos[txt_seq_len:], freqs_sin[txt_seq_len:])
+                    # Apply RoPE to image Q/K
+                    query = apply_rotary_emb(query, img_rotary_emb, sequence_dim=1)
+                    key = apply_rotary_emb(key, img_rotary_emb, sequence_dim=1)
+                    # Apply RoPE to text Q/K
+                    encoder_query = apply_rotary_emb(encoder_query, txt_rotary_emb, sequence_dim=1)
+                    encoder_key = apply_rotary_emb(encoder_key, txt_rotary_emb, sequence_dim=1)
+
                 # SP Mode: Use joint tensor mechanism
                 # - Image Q/K/V: (B, img_seq_len // SP, num_heads, head_dim) - will be AllToAll/Ring
                 # - Text Q/K/V: (B, txt_seq_len, num_heads, head_dim) - joint tensors, replicated
@@ -196,10 +206,15 @@ class LongCatImageAttention(nn.Module):
                     ),
                 )
             else:
-                # Non-SP Mode: Standard concatenation
+                # Non-SP Mode: Concat first, then apply RoPE to full sequence
                 joint_query = torch.cat([encoder_query, query], dim=1)
                 joint_key = torch.cat([encoder_key, key], dim=1)
                 joint_value = torch.cat([encoder_value, value], dim=1)
+
+                if image_rotary_emb is not None:
+                    # Apply RoPE to full (text + image) sequence
+                    joint_query = apply_rotary_emb(joint_query, image_rotary_emb, sequence_dim=1)
+                    joint_key = apply_rotary_emb(joint_key, image_rotary_emb, sequence_dim=1)
 
                 hidden_states = self.attn(
                     joint_query,
@@ -207,6 +222,13 @@ class LongCatImageAttention(nn.Module):
                     joint_value,
                 )
         else:
+            # No added_kv_proj_dim: single stream attention (e.g., from SingleTransformerBlock)
+            # hidden_states is already the combined sequence
+            if image_rotary_emb is not None:
+                # Apply RoPE to the full sequence
+                query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+                key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
             hidden_states = self.attn(
                 query,
                 key,
@@ -463,12 +485,7 @@ class LongCatImageSingleTransformerBlock(nn.Module):
             query = self.attn.norm_q(query)
             key = self.attn.norm_k(key)
 
-            # Apply RoPE if provided
-            if image_rotary_emb is not None:
-                query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
-                key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
-
-            # Step 2: Split into text and image parts
+            # Step 2: Split into text and image parts (before RoPE)
             # text_*: (B, txt_len, H, D)
             # img_*: (B, img_len/SP, H, D)
             text_query = query[:, :text_seq_len]
@@ -477,6 +494,27 @@ class LongCatImageSingleTransformerBlock(nn.Module):
             img_query = query[:, text_seq_len:]
             img_key = key[:, text_seq_len:]
             img_value = value[:, text_seq_len:]
+
+            # Apply RoPE separately to text and image parts
+            # image_rotary_emb contains [txt_pos, img_pos_full], need to split and chunk img
+            if image_rotary_emb is not None:
+                freqs_cos, freqs_sin = image_rotary_emb
+                # Split RoPE into text and image portions
+                txt_freqs_cos = freqs_cos[:text_seq_len]
+                txt_freqs_sin = freqs_sin[:text_seq_len]
+                img_freqs_cos = freqs_cos[text_seq_len:]
+                img_freqs_sin = freqs_sin[text_seq_len:]
+                # In SP mode, image is chunked, so chunk the image RoPE accordingly
+                sp_world_size = get_sequence_parallel_world_size()
+                sp_rank = get_sequence_parallel_rank()
+                img_freqs_cos = torch.chunk(img_freqs_cos, sp_world_size, dim=0)[sp_rank]
+                img_freqs_sin = torch.chunk(img_freqs_sin, sp_world_size, dim=0)[sp_rank]
+                # Apply RoPE to text Q/K
+                text_query = apply_rotary_emb(text_query, (txt_freqs_cos, txt_freqs_sin), sequence_dim=1)
+                text_key = apply_rotary_emb(text_key, (txt_freqs_cos, txt_freqs_sin), sequence_dim=1)
+                # Apply RoPE to image Q/K (chunked)
+                img_query = apply_rotary_emb(img_query, (img_freqs_cos, img_freqs_sin), sequence_dim=1)
+                img_key = apply_rotary_emb(img_key, (img_freqs_cos, img_freqs_sin), sequence_dim=1)
 
             # Step 3: Call underlying Attention with joint tensors
             # Image Q/K/V will go through SP AllToAll/Ring
