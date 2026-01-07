@@ -18,7 +18,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.data import OmniDiffusionConfig, get_current_omni_diffusion_config
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
@@ -158,18 +158,10 @@ class LongCatImageAttention(nn.Module):
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
 
-            # Check if SP is enabled dynamically (config may not be available at __init__ time)
-            use_sp_joint_attention = False
-            try:
-                config = get_current_omni_diffusion_config()
-                parallel_config = config.parallel_config
-                use_sp_joint_attention = (
-                    parallel_config is not None
-                    and parallel_config.sequence_parallel_size > 1
-                    and not get_forward_context().split_text_embed_in_sp
-                )
-            except Exception:
-                pass
+            # Check if SP is enabled from forward context (set by LongCatImageTransformer2DModel)
+            forward_ctx = get_forward_context()
+            sp_size = forward_ctx.sequence_parallel_size
+            use_sp_joint_attention = sp_size > 1 and not forward_ctx.split_text_embed_in_sp
 
             if use_sp_joint_attention:
                 # SP Mode: Apply RoPE separately to text and image Q/K
@@ -439,29 +431,18 @@ class LongCatImageSingleTransformerBlock(nn.Module):
         """
         text_seq_len = encoder_hidden_states.shape[1]
 
-        # Get SP config dynamically at forward time (not __init__ time)
-        # because config may not be set during model initialization
-        use_sp = False
-        try:
-            config = get_current_omni_diffusion_config()
-            parallel_config = config.parallel_config
-            use_sp = (
-                parallel_config is not None
-                and parallel_config.sequence_parallel_size > 1
-                and not get_forward_context().split_text_embed_in_sp
+        # Get SP config from forward context (set by LongCatImageTransformer2DModel)
+        forward_ctx = get_forward_context()
+        sp_size = forward_ctx.sequence_parallel_size
+        use_sp = sp_size > 1 and not forward_ctx.split_text_embed_in_sp
+
+        # Debug: Log SP status (only once)
+        if not hasattr(self, "_sp_logged"):
+            self._sp_logged = True
+            logger.info(
+                f"[SingleTransformerBlock] SP config: use_sp={use_sp}, "
+                f"sp_size={sp_size}, img_shape={hidden_states.shape}, txt_shape={encoder_hidden_states.shape}"
             )
-            # Debug: Log SP status (only once per forward)
-            if not hasattr(self, "_sp_logged"):
-                self._sp_logged = True
-                logger.info(
-                    f"[SingleTransformerBlock] SP config: use_sp={use_sp}, "
-                    f"sp_size={parallel_config.sequence_parallel_size if parallel_config else 'N/A'}, "
-                    f"img_shape={hidden_states.shape}, txt_shape={encoder_hidden_states.shape}"
-                )
-        except Exception as e:
-            if not hasattr(self, "_sp_logged"):
-                self._sp_logged = True
-                logger.warning(f"[SingleTransformerBlock] Failed to get SP config: {e}")
 
         # Concatenate text and image
         # In SP mode: image is chunked (B, img_len/SP, D), text is full (B, txt_len, D)
@@ -688,6 +669,8 @@ class LongCatImageTransformer2DModel(nn.Module):
         # Before: hidden_states shape = (B, img_seq_len, in_channels)
         # After:  hidden_states shape = (B, img_seq_len // SP, in_channels)
         sp_size = self.parallel_config.sequence_parallel_size
+        # Store SP size in forward context for sub-modules to access
+        get_forward_context().sequence_parallel_size = sp_size
         if sp_size > 1:
             sp_world_size = get_sequence_parallel_world_size()
             sp_rank = get_sequence_parallel_rank()

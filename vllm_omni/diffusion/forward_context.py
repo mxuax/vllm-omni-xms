@@ -20,6 +20,8 @@ class ForwardContext:
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None
     split_text_embed_in_sp: bool = False
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
+    sequence_parallel_size: int = 1
+    # sequence parallel size, used by sub-modules to determine SP behavior
 
     def __post_init__(self):
         pass
@@ -45,12 +47,14 @@ def create_forward_context(
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
     split_text_embed_in_sp: bool = False,
+    sequence_parallel_size: int = 1,
 ):
     return ForwardContext(
         vllm_config=vllm_config,
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
         split_text_embed_in_sp=split_text_embed_in_sp,
+        sequence_parallel_size=sequence_parallel_size,
     )
 
 
@@ -75,6 +79,7 @@ def set_forward_context(
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
     split_text_embed_in_sp: bool = False,
+    sequence_parallel_size: int = 1,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, split_text_embed_in_sp, etc.
@@ -85,6 +90,7 @@ def set_forward_context(
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
         split_text_embed_in_sp=split_text_embed_in_sp,
+        sequence_parallel_size=sequence_parallel_size,
     )
     with override_forward_context(forward_context):
         yield
