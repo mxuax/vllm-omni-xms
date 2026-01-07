@@ -477,23 +477,20 @@ class LongCatImageSingleTransformerBlock(nn.Module):
             img_value = value[:, text_seq_len:]
 
             # Apply RoPE separately to text and image parts
-            # image_rotary_emb contains [txt_pos, img_pos_full], need to split and chunk img
+            # image_rotary_emb from LongCatImageTransformer2DModel.forward already contains:
+            # - txt_freqs: full text RoPE (not chunked)
+            # - img_freqs: ALREADY chunked image RoPE (chunked in Transformer.forward)
             if image_rotary_emb is not None:
                 freqs_cos, freqs_sin = image_rotary_emb
-                # Split RoPE into text and image portions
+                # Split RoPE into text and image portions (image part is already chunked)
                 txt_freqs_cos = freqs_cos[:text_seq_len]
                 txt_freqs_sin = freqs_sin[:text_seq_len]
                 img_freqs_cos = freqs_cos[text_seq_len:]
                 img_freqs_sin = freqs_sin[text_seq_len:]
-                # In SP mode, image is chunked, so chunk the image RoPE accordingly
-                sp_world_size = get_sequence_parallel_world_size()
-                sp_rank = get_sequence_parallel_rank()
-                img_freqs_cos = torch.chunk(img_freqs_cos, sp_world_size, dim=0)[sp_rank]
-                img_freqs_sin = torch.chunk(img_freqs_sin, sp_world_size, dim=0)[sp_rank]
                 # Apply RoPE to text Q/K
                 text_query = apply_rotary_emb(text_query, (txt_freqs_cos, txt_freqs_sin), sequence_dim=1)
                 text_key = apply_rotary_emb(text_key, (txt_freqs_cos, txt_freqs_sin), sequence_dim=1)
-                # Apply RoPE to image Q/K (chunked)
+                # Apply RoPE to image Q/K (already chunked to match img_query shape)
                 img_query = apply_rotary_emb(img_query, (img_freqs_cos, img_freqs_sin), sequence_dim=1)
                 img_key = apply_rotary_emb(img_key, (img_freqs_cos, img_freqs_sin), sequence_dim=1)
 
