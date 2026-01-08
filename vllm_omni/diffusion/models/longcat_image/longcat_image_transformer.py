@@ -112,6 +112,55 @@ class LongCatImageAttention(nn.Module):
             causal=False,
         )
 
+    def _sp_attention_with_rope(
+        self,
+        img_query: torch.Tensor,
+        img_key: torch.Tensor,
+        img_value: torch.Tensor,
+        text_query: torch.Tensor,
+        text_key: torch.Tensor,
+        text_value: torch.Tensor,
+        text_seq_len: int,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> torch.Tensor:
+        """
+        Apply RoPE separately to text and image Q/K, then run SP attention with joint tensors.
+
+        This is the common SP attention pattern used by both dual-stream (added_kv_proj_dim)
+        and single-stream (no added_kv_proj_dim) blocks.
+
+        Args:
+            img_query/key/value: Image Q/K/V tensors (chunked in SP mode)
+            text_query/key/value: Text Q/K/V tensors (full, not chunked)
+            text_seq_len: Length of text sequence for splitting RoPE
+            image_rotary_emb: (freqs_cos, freqs_sin) containing [txt_pos, img_pos]
+
+        Returns:
+            Attention output with shape (B, txt_len + img_len/SP, H, D)
+        """
+        if image_rotary_emb is not None:
+            freqs_cos, freqs_sin = image_rotary_emb
+            txt_rotary_emb = (freqs_cos[:text_seq_len], freqs_sin[:text_seq_len])
+            img_rotary_emb_split = (freqs_cos[text_seq_len:], freqs_sin[text_seq_len:])
+            # Apply RoPE to image Q/K
+            img_query = apply_rotary_emb(img_query, img_rotary_emb_split, sequence_dim=1)
+            img_key = apply_rotary_emb(img_key, img_rotary_emb_split, sequence_dim=1)
+            # Apply RoPE to text Q/K
+            text_query = apply_rotary_emb(text_query, txt_rotary_emb, sequence_dim=1)
+            text_key = apply_rotary_emb(text_key, txt_rotary_emb, sequence_dim=1)
+
+        return self.attn(
+            img_query,
+            img_key,
+            img_value,
+            AttentionMetadata(
+                joint_query=text_query,
+                joint_key=text_key,
+                joint_value=text_value,
+                joint_strategy="front",
+            ),
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -164,38 +213,16 @@ class LongCatImageAttention(nn.Module):
             use_sp_joint_attention = sp_size > 1 and not forward_ctx.split_text_embed_in_sp
 
             if use_sp_joint_attention:
-                # SP Mode: Apply RoPE separately to text and image Q/K
-                # image_rotary_emb contains [txt_pos, img_pos], need to split
-                if image_rotary_emb is not None:
-                    freqs_cos, freqs_sin = image_rotary_emb
-                    txt_seq_len = encoder_query.shape[1]
-                    # Split RoPE: text portion and image portion
-                    txt_rotary_emb = (freqs_cos[:txt_seq_len], freqs_sin[:txt_seq_len])
-                    img_rotary_emb = (freqs_cos[txt_seq_len:], freqs_sin[txt_seq_len:])
-                    # Apply RoPE to image Q/K
-                    query = apply_rotary_emb(query, img_rotary_emb, sequence_dim=1)
-                    key = apply_rotary_emb(key, img_rotary_emb, sequence_dim=1)
-                    # Apply RoPE to text Q/K
-                    encoder_query = apply_rotary_emb(encoder_query, txt_rotary_emb, sequence_dim=1)
-                    encoder_key = apply_rotary_emb(encoder_key, txt_rotary_emb, sequence_dim=1)
-
-                # SP Mode: Use joint tensor mechanism
-                # - Image Q/K/V: (B, img_seq_len // SP, num_heads, head_dim) - will be AllToAll/Ring
-                # - Text Q/K/V: (B, txt_seq_len, num_heads, head_dim) - joint tensors, replicated
-                # The Attention layer internally handles:
-                #   1. AllToAll/Ring on image Q/K/V for SP communication
-                #   2. Prepending text K/V to each rank's image K/V
-                #   3. Computing attention: Q_img @ (K_txt + K_img), V_txt + V_img
-                hidden_states = self.attn(
-                    query,
-                    key,
-                    value,
-                    AttentionMetadata(
-                        joint_query=encoder_query,
-                        joint_key=encoder_key,
-                        joint_value=encoder_value,
-                        joint_strategy="front",
-                    ),
+                # SP Mode: Use common helper for RoPE + joint attention
+                hidden_states = self._sp_attention_with_rope(
+                    img_query=query,
+                    img_key=key,
+                    img_value=value,
+                    text_query=encoder_query,
+                    text_key=encoder_key,
+                    text_value=encoder_value,
+                    text_seq_len=encoder_query.shape[1],
+                    image_rotary_emb=image_rotary_emb,
                 )
             else:
                 # Non-SP Mode: Concat first, then apply RoPE to full sequence
@@ -226,40 +253,16 @@ class LongCatImageAttention(nn.Module):
 
             if use_sp_single_stream:
                 # SP Mode for single-stream block:
-                # Split QKV into text and image parts, then use joint tensor mechanism
-                text_query = query[:, :text_seq_len]
-                text_key = key[:, :text_seq_len]
-                text_value = value[:, :text_seq_len]
-                img_query = query[:, text_seq_len:]
-                img_key = key[:, text_seq_len:]
-                img_value = value[:, text_seq_len:]
-
-                # Apply RoPE separately
-                # image_rotary_emb contains [txt_pos, img_pos_chunked] (already chunked in Transformer)
-                if image_rotary_emb is not None:
-                    freqs_cos, freqs_sin = image_rotary_emb
-                    txt_freqs_cos = freqs_cos[:text_seq_len]
-                    txt_freqs_sin = freqs_sin[:text_seq_len]
-                    img_freqs_cos = freqs_cos[text_seq_len:]  # Already chunked
-                    img_freqs_sin = freqs_sin[text_seq_len:]
-                    # Apply RoPE to text Q/K
-                    text_query = apply_rotary_emb(text_query, (txt_freqs_cos, txt_freqs_sin), sequence_dim=1)
-                    text_key = apply_rotary_emb(text_key, (txt_freqs_cos, txt_freqs_sin), sequence_dim=1)
-                    # Apply RoPE to image Q/K
-                    img_query = apply_rotary_emb(img_query, (img_freqs_cos, img_freqs_sin), sequence_dim=1)
-                    img_key = apply_rotary_emb(img_key, (img_freqs_cos, img_freqs_sin), sequence_dim=1)
-
-                # Call attention with joint tensors
-                hidden_states = self.attn(
-                    img_query,
-                    img_key,
-                    img_value,
-                    AttentionMetadata(
-                        joint_query=text_query,
-                        joint_key=text_key,
-                        joint_value=text_value,
-                        joint_strategy="front",
-                    ),
+                # Split QKV into text and image parts, then use common helper
+                hidden_states = self._sp_attention_with_rope(
+                    img_query=query[:, text_seq_len:],
+                    img_key=key[:, text_seq_len:],
+                    img_value=value[:, text_seq_len:],
+                    text_query=query[:, :text_seq_len],
+                    text_key=key[:, :text_seq_len],
+                    text_value=value[:, :text_seq_len],
+                    text_seq_len=text_seq_len,
+                    image_rotary_emb=image_rotary_emb,
                 )
             else:
                 # Non-SP Mode: standard path
