@@ -215,17 +215,63 @@ class LongCatImageAttention(nn.Module):
                 )
         else:
             # No added_kv_proj_dim: single stream attention (e.g., from SingleTransformerBlock)
-            # hidden_states is already the combined sequence
-            if image_rotary_emb is not None:
-                # Apply RoPE to the full sequence
-                query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
-                key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+            # hidden_states is the combined (text + image) sequence
+            # In SP mode, image part is chunked: (B, txt_len + img_len/SP, D)
 
-            hidden_states = self.attn(
-                query,
-                key,
-                value,
-            )
+            # Check if SP is enabled and we have text_seq_len info
+            forward_ctx = get_forward_context()
+            sp_size = forward_ctx.sequence_parallel_size
+            text_seq_len = kwargs.get("text_seq_len", None)
+            use_sp_single_stream = sp_size > 1 and not forward_ctx.split_text_embed_in_sp and text_seq_len is not None
+
+            if use_sp_single_stream:
+                # SP Mode for single-stream block:
+                # Split QKV into text and image parts, then use joint tensor mechanism
+                text_query = query[:, :text_seq_len]
+                text_key = key[:, :text_seq_len]
+                text_value = value[:, :text_seq_len]
+                img_query = query[:, text_seq_len:]
+                img_key = key[:, text_seq_len:]
+                img_value = value[:, text_seq_len:]
+
+                # Apply RoPE separately
+                # image_rotary_emb contains [txt_pos, img_pos_chunked] (already chunked in Transformer)
+                if image_rotary_emb is not None:
+                    freqs_cos, freqs_sin = image_rotary_emb
+                    txt_freqs_cos = freqs_cos[:text_seq_len]
+                    txt_freqs_sin = freqs_sin[:text_seq_len]
+                    img_freqs_cos = freqs_cos[text_seq_len:]  # Already chunked
+                    img_freqs_sin = freqs_sin[text_seq_len:]
+                    # Apply RoPE to text Q/K
+                    text_query = apply_rotary_emb(text_query, (txt_freqs_cos, txt_freqs_sin), sequence_dim=1)
+                    text_key = apply_rotary_emb(text_key, (txt_freqs_cos, txt_freqs_sin), sequence_dim=1)
+                    # Apply RoPE to image Q/K
+                    img_query = apply_rotary_emb(img_query, (img_freqs_cos, img_freqs_sin), sequence_dim=1)
+                    img_key = apply_rotary_emb(img_key, (img_freqs_cos, img_freqs_sin), sequence_dim=1)
+
+                # Call attention with joint tensors
+                hidden_states = self.attn(
+                    img_query,
+                    img_key,
+                    img_value,
+                    AttentionMetadata(
+                        joint_query=text_query,
+                        joint_key=text_key,
+                        joint_value=text_value,
+                        joint_strategy="front",
+                    ),
+                )
+            else:
+                # Non-SP Mode: standard path
+                if image_rotary_emb is not None:
+                    query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+                    key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+                hidden_states = self.attn(
+                    query,
+                    key,
+                    value,
+                )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
@@ -379,27 +425,20 @@ class LongCatImageSingleTransformerBlock(nn.Module):
     """
     Single-stream Transformer block for LongCat with SP (Sequence Parallelism) support.
 
-    In SP mode, instead of concatenating text and image hidden states before attention,
-    we pass text as joint tensors through AttentionMetadata, allowing the attention layer
-    to handle the text correctly with AllToAll or Ring communication.
+    SP handling is delegated to LongCatImageAttention via the text_seq_len parameter.
+    This keeps the block logic clean and centralizes SP logic in the attention layer.
     """
 
     def __init__(self, dim: int, num_attention_heads: int, attention_head_dim: int, mlp_ratio: float = 4.0):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
-        self.heads = num_attention_heads
-        self.head_dim = attention_head_dim
 
         self.norm = AdaLayerNormZeroSingle(dim)
         self.proj_mlp = nn.Linear(dim, self.mlp_hidden_dim)
         self.act_mlp = nn.GELU(approximate="tanh")
         self.proj_out = nn.Linear(dim + self.mlp_hidden_dim, dim)
 
-        self.heads = num_attention_heads
-        self.head_dim = attention_head_dim
-
-        # Keep original model structure (no added_kv_proj_dim)
-        # SP is handled by manually splitting Q/K/V in forward
+        # SP handling is delegated to LongCatImageAttention via text_seq_len kwarg
         self.attn = LongCatImageAttention(
             query_dim=dim,
             dim_head=attention_head_dim,
@@ -421,28 +460,10 @@ class LongCatImageSingleTransformerBlock(nn.Module):
         """
         Forward pass for SingleTransformerBlock with SP support.
 
-        In SP mode, we manually handle the QKV projection and split text/image
-        to use joint tensor mechanism correctly:
-        1. Concatenate text + image_chunk
-        2. Project to QKV using attn.to_qkv
-        3. Split QKV into text and image parts
-        4. Pass image QKV to attention with text as joint tensors
-        5. Combine outputs
+        SP handling is delegated to LongCatImageAttention.forward via text_seq_len kwarg.
+        This keeps the block logic clean and centralizes SP logic in the attention layer.
         """
         text_seq_len = encoder_hidden_states.shape[1]
-
-        # Get SP config from forward context (set by LongCatImageTransformer2DModel)
-        forward_ctx = get_forward_context()
-        sp_size = forward_ctx.sequence_parallel_size
-        use_sp = sp_size > 1 and not forward_ctx.split_text_embed_in_sp
-
-        # Debug: Log SP status (only once)
-        if not hasattr(self, "_sp_logged"):
-            self._sp_logged = True
-            logger.info(
-                f"[SingleTransformerBlock] SP config: use_sp={use_sp}, "
-                f"sp_size={sp_size}, img_shape={hidden_states.shape}, txt_shape={encoder_hidden_states.shape}"
-            )
 
         # Concatenate text and image
         # In SP mode: image is chunked (B, img_len/SP, D), text is full (B, txt_len, D)
@@ -451,76 +472,15 @@ class LongCatImageSingleTransformerBlock(nn.Module):
         norm_hidden_states, gate = self.norm(combined, emb=temb)
         mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
 
-        if use_sp:
-            # SP Mode: Manually handle QKV to use joint tensor mechanism
-            # Step 1: Project entire sequence using attn.to_qkv
-            qkv, _ = self.attn.to_qkv(norm_hidden_states)
-            query, key, value = qkv.chunk(3, dim=-1)
-
-            # Reshape to multi-head format: (B, S, H, D)
-            query = query.unflatten(-1, (self.heads, -1))
-            key = key.unflatten(-1, (self.heads, -1))
-            value = value.unflatten(-1, (self.heads, -1))
-
-            # Apply RMSNorm
-            query = self.attn.norm_q(query)
-            key = self.attn.norm_k(key)
-
-            # Step 2: Split into text and image parts (before RoPE)
-            # text_*: (B, txt_len, H, D)
-            # img_*: (B, img_len/SP, H, D)
-            text_query = query[:, :text_seq_len]
-            text_key = key[:, :text_seq_len]
-            text_value = value[:, :text_seq_len]
-            img_query = query[:, text_seq_len:]
-            img_key = key[:, text_seq_len:]
-            img_value = value[:, text_seq_len:]
-
-            # Apply RoPE separately to text and image parts
-            # image_rotary_emb from LongCatImageTransformer2DModel.forward already contains:
-            # - txt_freqs: full text RoPE (not chunked)
-            # - img_freqs: ALREADY chunked image RoPE (chunked in Transformer.forward)
-            if image_rotary_emb is not None:
-                freqs_cos, freqs_sin = image_rotary_emb
-                # Split RoPE into text and image portions (image part is already chunked)
-                txt_freqs_cos = freqs_cos[:text_seq_len]
-                txt_freqs_sin = freqs_sin[:text_seq_len]
-                img_freqs_cos = freqs_cos[text_seq_len:]
-                img_freqs_sin = freqs_sin[text_seq_len:]
-                # Apply RoPE to text Q/K
-                text_query = apply_rotary_emb(text_query, (txt_freqs_cos, txt_freqs_sin), sequence_dim=1)
-                text_key = apply_rotary_emb(text_key, (txt_freqs_cos, txt_freqs_sin), sequence_dim=1)
-                # Apply RoPE to image Q/K (already chunked to match img_query shape)
-                img_query = apply_rotary_emb(img_query, (img_freqs_cos, img_freqs_sin), sequence_dim=1)
-                img_key = apply_rotary_emb(img_key, (img_freqs_cos, img_freqs_sin), sequence_dim=1)
-
-            # Step 3: Call underlying Attention with joint tensors
-            # Image Q/K/V will go through SP AllToAll/Ring
-            # Text Q/K/V will be handled as joint tensors (replicated)
-            attn_output = self.attn.attn(
-                img_query,
-                img_key,
-                img_value,
-                AttentionMetadata(
-                    joint_query=text_query,
-                    joint_key=text_key,
-                    joint_value=text_value,
-                    joint_strategy="front",
-                ),
-            )
-
-            # Step 4: Flatten and convert dtype
-            # Output: (B, txt_len + img_len/SP, H, D) -> (B, txt_len + img_len/SP, D)
-            attn_output = attn_output.flatten(2, 3)
-            attn_output = attn_output.to(query.dtype)
-        else:
-            # Non-SP Mode: Original path
-            joint_attention_kwargs = joint_attention_kwargs or {}
-            attn_output = self.attn(
-                hidden_states=norm_hidden_states,
-                image_rotary_emb=image_rotary_emb,
-                **joint_attention_kwargs,
-            )
+        # Delegate SP handling to LongCatImageAttention by passing text_seq_len
+        # LongCatImageAttention will detect SP mode and handle text/image splitting internally
+        joint_attention_kwargs = joint_attention_kwargs or {}
+        attn_output = self.attn(
+            hidden_states=norm_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+            text_seq_len=text_seq_len,  # Pass text_seq_len for SP mode handling
+            **joint_attention_kwargs,
+        )
 
         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
         gate = gate.unsqueeze(1)
