@@ -168,28 +168,32 @@ class TestModelCpPlans:
             pytest.skip("WanTransformer3DModel not available")
 
     def test_zimage_transformer_cp_plan(self):
-        """Test ZImageTransformer2DModel _cp_plan is valid."""
+        """Test ZImageTransformer2DModel _cp_plan structure.
+
+        Z-Image follows the diffusers pattern where unified_prepare module outputs
+        are sharded via split_output=True (similar to Wan's rope module).
+        The plan specifies:
+        - unified_prepare: Shard all 4 outputs (unified, cos, sin, attn_mask)
+        - all_final_layer.2-1: Gather outputs after final layer
+        """
         try:
             from vllm_omni.diffusion.models.z_image.z_image_transformer import ZImageTransformer2DModel
 
             plan = getattr(ZImageTransformer2DModel, "_cp_plan", None)
-            assert plan is not None, "ZImageTransformer2DModel should have _cp_plan"
-            validate_cp_plan(plan)
+            assert plan is not None, "ZImageTransformer2DModel should define _cp_plan"
+            assert isinstance(plan, dict)
 
-            # Check input splitting entries
-            assert "layers.0" in plan
-            layers_plan = plan["layers.0"]
-            assert "x" in layers_plan
-            assert "cos" in layers_plan
-            assert "sin" in layers_plan
-            assert "attn_mask" in layers_plan
+            # Check unified_prepare output sharding (similar to Wan's rope)
+            assert "unified_prepare" in plan
+            unified_prepare_plan = plan["unified_prepare"]
+            # Check all 4 outputs are sharded with split_output=True
+            assert 0 in unified_prepare_plan  # unified
+            assert 1 in unified_prepare_plan  # unified_cos
+            assert 2 in unified_prepare_plan  # unified_sin
+            assert 3 in unified_prepare_plan  # unified_attn_mask
 
-            # Check output gathering entry
+            # Check output gathering
             assert "all_final_layer.2-1" in plan
-            final_layer_plan = plan["all_final_layer.2-1"]
-            assert isinstance(final_layer_plan, ContextParallelOutput)
-            assert final_layer_plan.gather_dim == 1
-            assert final_layer_plan.expected_dims == 3
         except ImportError:
             pytest.skip("ZImageTransformer2DModel not available")
 

@@ -33,14 +33,77 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.distributed import ContextParallelInput, ContextParallelOutput
-from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.distributed.cp_plan import (
+    ContextParallelInput,
+    ContextParallelOutput,
+)
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
 
 logger = init_logger(__name__)
+
+
+class UnifiedPrepare(nn.Module):
+    """Prepares unified tensors for transformer blocks.
+
+    This module encapsulates the unification of x and cap tensors into unified
+    sequences. Similar to how Wan's `rope` module outputs rotary embeddings,
+    this module outputs unified tensors that can be sharded via _cp_plan's
+    split_output=True mechanism.
+
+    This follows the diffusers pattern where tensor preparation happens in
+    a dedicated submodule, enabling _cp_plan hooks to work at module boundaries.
+    """
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_cos: torch.Tensor,
+        x_sin: torch.Tensor,
+        cap_feats: torch.Tensor,
+        cap_cos: torch.Tensor,
+        cap_sin: torch.Tensor,
+        x_item_seqlens: list[int],
+        cap_item_seqlens: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Combine x and cap tensors into unified sequences.
+
+        Returns:
+            unified: Combined hidden states [batch, seq_len, dim]
+            unified_cos: Combined RoPE cos [batch, seq_len, rope_dim]
+            unified_sin: Combined RoPE sin [batch, seq_len, rope_dim]
+            unified_attn_mask: Combined attention mask [batch, seq_len]
+        """
+        bsz = x.shape[0]
+        device = x.device
+
+        unified = []
+        unified_cos = []
+        unified_sin = []
+        for i in range(bsz):
+            x_len = x_item_seqlens[i]
+            cap_len = cap_item_seqlens[i]
+            unified.append(torch.cat([x[i][:x_len], cap_feats[i][:cap_len]]))
+            unified_cos.append(torch.cat([x_cos[i][:x_len], cap_cos[i][:cap_len]]))
+            unified_sin.append(torch.cat([x_sin[i][:x_len], cap_sin[i][:cap_len]]))
+
+        unified_item_seqlens = [a + b for a, b in zip(cap_item_seqlens, x_item_seqlens)]
+        unified_max_item_seqlen = max(unified_item_seqlens)
+
+        unified = pad_sequence(unified, batch_first=True, padding_value=0.0)
+        unified_cos = pad_sequence(unified_cos, batch_first=True, padding_value=0.0)
+        unified_sin = pad_sequence(unified_sin, batch_first=True, padding_value=0.0)
+        unified_attn_mask = torch.zeros((bsz, unified_max_item_seqlen), dtype=torch.bool, device=device)
+        for i, seq_len in enumerate(unified_item_seqlens):
+            unified_attn_mask[i, :seq_len] = 1
+
+        return unified, unified_cos, unified_sin, unified_attn_mask
 
 
 def _positive_divisors(n: int) -> set[int]:
@@ -479,24 +542,24 @@ class ZImageTransformer2DModel(nn.Module):
 
     _repeated_blocks = ["ZImageTransformerBlock"]
 
-    # Context Parallelism plan for Z-Image
-    # Applied to main transformer layers processing unified image+caption sequence
+    # Context Parallelism for Z-Image (following diffusers pattern)
+    # Similar to how Wan uses `rope` module's split_output to shard rotary embeddings,
+    # Z-Image uses `unified_prepare` module's split_output to shard unified tensors.
+    #
+    # The _cp_plan specifies sharding/gathering at module boundaries:
+    # - unified_prepare: Split all 4 outputs (unified, cos, sin, attn_mask) via split_output=True
+    # - layers.0: hidden_states input is already sharded from unified_prepare output
+    # - all_final_layer.2-1: Gather outputs after the final layer
     _cp_plan = {
-        # Split inputs at first main transformer block
-        # ZImageTransformerBlock.forward(x, attn_mask, cos, sin, adaln_input)
-        # x shape: [batch, seq_len, dim]
-        # cos/sin shape: [batch, seq_len, rope_dim]
-        # attn_mask shape: [batch, seq_len]
-        "layers.0": {
-            "x": ContextParallelInput(split_dim=1, expected_dims=3, split_output=False),
-            "cos": ContextParallelInput(split_dim=1, expected_dims=3, split_output=False),
-            "sin": ContextParallelInput(split_dim=1, expected_dims=3, split_output=False),
-            "attn_mask": ContextParallelInput(split_dim=1, expected_dims=2, split_output=False),
+        # Shard unified_prepare outputs (similar to Wan's rope module)
+        # This shards all 4 return values: unified, unified_cos, unified_sin, unified_attn_mask
+        "unified_prepare": {
+            0: ContextParallelInput(split_dim=1, expected_dims=3, split_output=True),  # unified
+            1: ContextParallelInput(split_dim=1, expected_dims=3, split_output=True),  # unified_cos
+            2: ContextParallelInput(split_dim=1, expected_dims=3, split_output=True),  # unified_sin
+            3: ContextParallelInput(split_dim=1, expected_dims=2, split_output=True),  # unified_attn_mask
         },
         # Gather output at final_layer (default: patch_size=2, f_patch_size=1)
-        # FinalLayer.forward returns: [batch, seq_len, out_channels]
-        # Note: If using different patch configs (e.g., patch_size=4), add:
-        #   "all_final_layer.4-1": ContextParallelOutput(gather_dim=1, expected_dims=3),
         "all_final_layer.2-1": ContextParallelOutput(gather_dim=1, expected_dims=3),
     }
 
@@ -613,6 +676,11 @@ class ZImageTransformer2DModel(nn.Module):
         self.axes_lens = axes_lens
 
         self.rope_embedder = RopeEmbedder(theta=rope_theta, axes_dims=axes_dims, axes_lens=axes_lens)
+
+        # UnifiedPrepare module for combining x and cap tensors
+        # This enables _cp_plan to shard outputs via split_output=True
+        # Similar to how Wan's rope module enables rotary embedding sharding
+        self.unified_prepare = UnifiedPrepare()
 
     def unpatchify(self, x: list[torch.Tensor], size: list[tuple], patch_size, f_patch_size) -> list[torch.Tensor]:
         pH = pW = patch_size
@@ -814,31 +882,19 @@ class ZImageTransformer2DModel(nn.Module):
         for layer in self.context_refiner:
             cap_feats = layer(cap_feats, cap_attn_mask, cap_cos, cap_sin)
 
-        # unified
-        unified = []
-        unified_cos = []
-        unified_sin = []
-        for i in range(bsz):
-            x_len = x_item_seqlens[i]
-            cap_len = cap_item_seqlens[i]
-            unified.append(torch.cat([x[i][:x_len], cap_feats[i][:cap_len]]))
-            unified_cos.append(torch.cat([x_cos[i][:x_len], cap_cos[i][:cap_len]]))
-            unified_sin.append(torch.cat([x_sin[i][:x_len], cap_sin[i][:cap_len]]))
-        unified_item_seqlens = [a + b for a, b in zip(cap_item_seqlens, x_item_seqlens)]
-        assert unified_item_seqlens == [len(_) for _ in unified]
-        unified_max_item_seqlen = max(unified_item_seqlens)
+        # Prepare unified tensors via UnifiedPrepare module
+        # This enables _cp_plan to shard outputs via split_output=True
+        unified, unified_cos, unified_sin, unified_attn_mask = self.unified_prepare(
+            x, x_cos, x_sin, cap_feats, cap_cos, cap_sin, x_item_seqlens, cap_item_seqlens
+        )
 
-        unified = pad_sequence(unified, batch_first=True, padding_value=0.0)
-        unified_cos = pad_sequence(unified_cos, batch_first=True, padding_value=0.0)
-        unified_sin = pad_sequence(unified_sin, batch_first=True, padding_value=0.0)
-        unified_attn_mask = torch.zeros((bsz, unified_max_item_seqlen), dtype=torch.bool, device=device)
-        for i, seq_len in enumerate(unified_item_seqlens):
-            unified_attn_mask[i, :seq_len] = 1
-
+        # Main transformer blocks
         for layer in self.layers:
             unified = layer(unified, unified_attn_mask, unified_cos, unified_sin, adaln_input)
 
+        # Final layer
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](unified, adaln_input)
+
         unified = list(unified.unbind(dim=0))
         x = self.unpatchify(unified, x_size, patch_size, f_patch_size)
 
