@@ -3,9 +3,15 @@
 
 import importlib
 
+from vllm.logger import init_logger
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cp_config import ContextParallelConfig
+from vllm_omni.diffusion.distributed.cp_plan import get_cp_plan_from_model
+from vllm_omni.diffusion.hooks.context_parallel import apply_context_parallel
+
+logger = init_logger(__name__)
 
 _DIFFUSION_MODELS = {
     # arch:(mod_folder, mod_relname, cls_name)
@@ -91,6 +97,23 @@ DiffusionModelRegistry = _ModelRegistry(
 def initialize_model(
     od_config: OmniDiffusionConfig,
 ):
+    """Initialize a diffusion model from the registry.
+
+    This function:
+    1. Loads the model class from the registry
+    2. Instantiates the model with the config
+    3. Configures VAE optimization settings
+    4. Applies context parallelism if enabled (similar to diffusers' enable_parallelism)
+
+    Args:
+        od_config: The OmniDiffusion configuration.
+
+    Returns:
+        The initialized pipeline model.
+
+    Raises:
+        ValueError: If the model class is not found in the registry.
+    """
     model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
     if model_class is not None:
         model = model_class(od_config=od_config)
@@ -100,9 +123,68 @@ def initialize_model(
         if hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
 
+        # Apply context parallelism if enabled
+        # This follows diffusers' pattern where enable_parallelism() is called
+        # at model loading time, not inside individual model files
+        _apply_context_parallel_if_enabled(model, od_config)
+
         return model
     else:
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
+
+
+def _apply_context_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
+    """Apply context parallelism hooks if SP is enabled.
+
+    This is the centralized location for enabling CP, similar to diffusers'
+    ModelMixin.enable_parallelism() method. It applies _cp_plan hooks to
+    transformer models that define them.
+
+    Args:
+        model: The pipeline model (e.g., ZImagePipeline).
+        od_config: The OmniDiffusion configuration.
+    """
+
+    try:
+        sp_size = od_config.parallel_config.sequence_parallel_size
+        if sp_size <= 1:
+            return
+
+        # Find transformer model(s) in the pipeline that have _cp_plan
+        transformer_attrs = ["transformer", "dit", "unet"]
+        for attr in transformer_attrs:
+            if not hasattr(model, attr):
+                continue
+
+            transformer = getattr(model, attr)
+            if transformer is None:
+                continue
+
+            plan = get_cp_plan_from_model(transformer)
+            if plan is None:
+                continue
+
+            # Create CP config
+            cp_config = ContextParallelConfig(
+                ulysses_degree=od_config.parallel_config.ulysses_degree,
+                ring_degree=od_config.parallel_config.ring_degree,
+            )
+
+            # Apply hooks according to the plan
+            mode = (
+                "hybrid"
+                if cp_config.ulysses_degree > 1 and cp_config.ring_degree > 1
+                else ("ulysses" if cp_config.ulysses_degree > 1 else "ring")
+            )
+            logger.info(
+                f"Applying context parallelism to {transformer.__class__.__name__} "
+                f"(sp_size={sp_size}, mode={mode}, ulysses={cp_config.ulysses_degree}, ring={cp_config.ring_degree})"
+            )
+            apply_context_parallel(transformer, cp_config, plan)
+            return  # Only apply to first transformer found
+
+    except Exception as e:
+        logger.warning(f"Failed to apply context parallelism: {e}. Continuing without CP hooks.")
 
 
 _DIFFUSION_POST_PROCESS_FUNCS = {

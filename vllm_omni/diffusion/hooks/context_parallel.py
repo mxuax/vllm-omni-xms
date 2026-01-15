@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project and the
-# HuggingFace Team. All rights reserved.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project and the HuggingFace Team.
+# All rights reserved.
 #
 # This module is adapted from HuggingFace diffusers library:
 #   diffusers/src/diffusers/hooks/context_parallel.py
@@ -424,6 +424,14 @@ def apply_context_parallel(
     This function registers hooks on the specified submodules to automatically
     shard inputs and gather outputs for context parallelism.
 
+    The complete CP flow is:
+    1. Input sharding (ContextParallelSplitHook): Split sequence across SP ranks
+    2. Attention parallelism (handled by vLLM-Omni's Attention layer):
+       - Ulysses: All-to-All over Q/K/V heads
+       - Ring: K/V circulation in ring topology
+       - Hybrid: Both (Ulysses handles heads, Ring handles K/V)
+    3. Output gathering (ContextParallelGatherHook): Gather sequence from SP ranks
+
     Args:
         module: The model to apply CP to.
         config: The context parallel configuration.
@@ -436,8 +444,17 @@ def apply_context_parallel(
             "proj_out": ContextParallelOutput(gather_dim=1, expected_dims=3),
         }
         apply_context_parallel(model, config, plan)
+
+    Note:
+        vLLM-Omni's Attention layer automatically handles the internal
+        parallelism (Ulysses All-to-All or Ring attention) based on the
+        forward_context configuration. This function only handles input/output
+        sharding for the model as a whole.
     """
-    logger.debug(f"Applying context parallel with config: {config} and plan: {plan}")
+    logger.debug(
+        f"Applying context parallel with config: ulysses={config.ulysses_degree}, "
+        f"ring={config.ring_degree}, plan keys: {list(plan.keys())}"
+    )
 
     for module_id, cp_model_plan in plan.items():
         submodule = _get_submodule_by_name(module, module_id)
@@ -505,6 +522,11 @@ def enable_context_parallel_for_model(
     This is a convenience function that reads the model's _cp_plan attribute
     and applies context parallelism automatically.
 
+    The function performs two main tasks:
+    1. Applies _cp_plan hooks to shard inputs and gather outputs
+    2. Ensures Attention layers are configured for the correct parallel mode
+       (handled automatically by vLLM-Omni's forward_context mechanism)
+
     Args:
         model: The model to enable CP for. Must have a _cp_plan attribute.
         config: Optional config. If None, uses default based on current
@@ -512,6 +534,13 @@ def enable_context_parallel_for_model(
 
     Raises:
         ValueError: If model has no _cp_plan defined.
+
+    Note:
+        vLLM-Omni supports Ulysses + Ring hybrid parallelism:
+        - ulysses_degree > 1: Uses All-to-All communication over Q/K/V heads
+        - ring_degree > 1: Uses Ring attention with K/V passing
+        - Both > 1: Hybrid mode (Ulysses handles head redistribution,
+          Ring handles K/V circulation)
     """
     from vllm_omni.diffusion.distributed.cp_plan import get_cp_plan_from_model
     from vllm_omni.diffusion.distributed.parallel_state import (
@@ -528,12 +557,26 @@ def enable_context_parallel_for_model(
 
     if config is None:
         # Create config from current parallel state
+        ulysses_degree = get_ulysses_parallel_world_size()
+        ring_degree = get_ring_parallel_world_size()
         config = ContextParallelConfig(
-            ulysses_degree=get_ulysses_parallel_world_size(),
-            ring_degree=get_ring_parallel_world_size(),
+            ulysses_degree=ulysses_degree,
+            ring_degree=ring_degree,
+        )
+        if ulysses_degree > 1 and ring_degree > 1:
+            mode = "hybrid"
+        elif ulysses_degree > 1:
+            mode = "ulysses"
+        else:
+            mode = "ring"
+        logger.info(
+            f"Created CP config from parallel state: "
+            f"ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, "
+            f"mode={mode}"
         )
 
     apply_context_parallel(model, config, plan)
+    logger.info(f"Enabled context parallelism for {model.__class__.__name__}")
 
 
 def disable_context_parallel_for_model(model: nn.Module) -> None:
