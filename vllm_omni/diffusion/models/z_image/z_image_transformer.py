@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# _cp_plan definition adapted from HuggingFace diffusers library
 
 # Copyright 2025 Alibaba Z-Image Team and The HuggingFace Team. All rights reserved.
 #
@@ -32,6 +33,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.distributed import ContextParallelInput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
@@ -456,7 +458,42 @@ class RopeEmbedder:
 
 
 class ZImageTransformer2DModel(nn.Module):
+    """Z-Image Transformer model for image generation.
+
+    Context Parallelism:
+        This model supports non-intrusive CP via _cp_plan. The plan specifies:
+        - Input splitting at first main transformer block (unified sequence)
+        - RoPE (cos/sin) splitting along sequence dimension
+        - Attention mask splitting along sequence dimension
+
+        The CP is applied to the main `layers` transformer blocks where the
+        unified image+caption sequence is processed jointly.
+
+        Note: noise_refiner and context_refiner are NOT parallelized as they
+        process image and caption separately before unification.
+    """
+
     _repeated_blocks = ["ZImageTransformerBlock"]
+
+    # Context Parallelism plan for Z-Image
+    # Applied to main transformer layers processing unified image+caption sequence
+    _cp_plan = {
+        # Split inputs at first main transformer block
+        # ZImageTransformerBlock.forward(x, attn_mask, cos, sin, adaln_input)
+        # x shape: [batch, seq_len, dim]
+        # cos/sin shape: [batch, seq_len, rope_dim]
+        # attn_mask shape: [batch, seq_len]
+        "layers.0": {
+            "x": ContextParallelInput(split_dim=1, expected_dims=3, split_output=False),
+            "cos": ContextParallelInput(split_dim=1, expected_dims=3, split_output=False),
+            "sin": ContextParallelInput(split_dim=1, expected_dims=3, split_output=False),
+            "attn_mask": ContextParallelInput(split_dim=1, expected_dims=2, split_output=False),
+        },
+        # Note: We don't gather at final_layer because:
+        # 1. final_layer is in ModuleDict (dynamically selected)
+        # 2. Output needs to be unpadded per-sample after gathering
+        # Instead, gathering should be done in the forward method or pipeline
+    }
 
     def __init__(
         self,
