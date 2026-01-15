@@ -1,10 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project and the
+# HuggingFace Team. All rights reserved.
+#
+# This module is adapted from HuggingFace diffusers library:
+#   diffusers/src/diffusers/hooks/context_parallel.py
+#
+# Key adaptations from diffusers:
+#   - ModuleForwardMetadata: parameter lookup logic (adapted)
+#   - ContextParallelSplitHook/GatherHook: hook structure (adapted)
+#   - apply_context_parallel: registration logic (adapted)
+#
+# Key differences from diffusers:
+#   - Uses vLLM-Omni's SequenceParallelGroupCoordinator instead of DeviceMesh
+#   - Uses cp_shard/cp_gather from cp_sharding.py instead of funcol operations
+#   - Supports Ulysses + Ring hybrid parallelism
+#
 """Context Parallelism hooks for non-intrusive CP support.
 
 This module implements the hook-based mechanism for applying context parallelism
-to models without modifying their forward() methods. It is inspired by diffusers'
-_cp_plan approach but uses vLLM-Omni's existing parallel state management.
+to models without modifying their forward() methods.
 
 Usage:
     1. Define _cp_plan on your model class
@@ -27,9 +41,11 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.cp_config import ContextParallelConfig
 from vllm_omni.diffusion.distributed.cp_plan import (
+    AnyContextParallelInput,
     ContextParallelInput,
     ContextParallelModelPlan,
     ContextParallelOutput,
+    ContextParallelPartialInput,
 )
 from vllm_omni.diffusion.distributed.cp_sharding import cp_gather, cp_shard
 from vllm_omni.diffusion.hooks.base import HookRegistry, ModelHook
@@ -136,17 +152,22 @@ class ContextParallelSplitHook(ModelHook):
     sharded inputs to the original forward.
 
     For split_output=True inputs, it shards the output instead.
+
+    Supports both ContextParallelInput (full split) and ContextParallelPartialInput
+    (partial split for text/image separation).
     """
 
     def __init__(
         self,
-        metadata: dict[str | int, ContextParallelInput | list[ContextParallelInput]],
+        metadata: dict[str | int, AnyContextParallelInput | list[AnyContextParallelInput]],
         config: ContextParallelConfig,
     ) -> None:
         super().__init__()
         self.metadata = metadata
         self.config = config
         self.module_forward_metadata: ModuleForwardMetadata | None = None
+        # Cache for text lengths resolved from kwargs
+        self._text_len_cache: dict[str, int] = {}
 
     def initialize_hook(self, module: nn.Module) -> nn.Module:
         cls = _unwrap_module(module).__class__
@@ -156,10 +177,12 @@ class ContextParallelSplitHook(ModelHook):
     def pre_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> tuple[tuple, dict]:
         """Shard inputs before forward."""
         args_list = list(args)
+        # Clear text length cache for this forward pass
+        self._text_len_cache.clear()
 
         for name, cpm in self.metadata.items():
             # Skip if this is a split_output entry (handled in post_forward)
-            if isinstance(cpm, ContextParallelInput) and cpm.split_output:
+            if isinstance(cpm, (ContextParallelInput, ContextParallelPartialInput)) and cpm.split_output:
                 continue
 
             # Get the parameter value
@@ -172,7 +195,7 @@ class ContextParallelSplitHook(ModelHook):
 
             # Shard the input
             if isinstance(input_val, torch.Tensor):
-                input_val = self._prepare_cp_input(input_val, cpm)
+                input_val = self._prepare_cp_input(input_val, cpm, args_list, kwargs)
             elif isinstance(input_val, (list, tuple)):
                 # Handle list/tuple of tensors with per-element config
                 if not isinstance(cpm, (list, tuple)):
@@ -185,7 +208,7 @@ class ContextParallelSplitHook(ModelHook):
                 sharded_input_val = []
                 for i, x in enumerate(input_val):
                     if torch.is_tensor(x) and not cpm[i].split_output:
-                        x = self._prepare_cp_input(x, cpm[i])
+                        x = self._prepare_cp_input(x, cpm[i], args_list, kwargs)
                     sharded_input_val.append(x)
                 input_val = type(input_val)(sharded_input_val)
             else:
@@ -198,6 +221,10 @@ class ContextParallelSplitHook(ModelHook):
                 args_list[index] = input_val
             else:
                 raise ValueError(f"Failed to update parameter '{name}' after sharding.")
+
+        # Store kwargs for post_forward to resolve text lengths
+        self._last_kwargs = kwargs
+        self._last_args = tuple(args_list)
 
         return tuple(args_list), kwargs
 
@@ -215,22 +242,80 @@ class ContextParallelSplitHook(ModelHook):
         for index, cpm in self.metadata.items():
             if not isinstance(index, int):
                 continue
-            if not isinstance(cpm, ContextParallelInput) or not cpm.split_output:
+            if not isinstance(cpm, (ContextParallelInput, ContextParallelPartialInput)) or not cpm.split_output:
                 continue
             if index >= len(output_list):
                 raise ValueError(f"Index {index} out of bounds for output of length {len(output_list)}.")
 
-            output_list[index] = self._prepare_cp_input(output_list[index], cpm)
+            output_list[index] = self._prepare_cp_input(output_list[index], cpm, self._last_args, self._last_kwargs)
 
         return output_list[0] if is_tensor else type(output)(output_list)
 
-    def _prepare_cp_input(self, x: torch.Tensor, cp_input: ContextParallelInput) -> torch.Tensor:
+    def _resolve_text_len(
+        self,
+        cp_input: ContextParallelPartialInput,
+        args: tuple,
+        kwargs: dict,
+    ) -> int:
+        """Resolve text length from the source specification."""
+        source = cp_input.text_len_source
+
+        if isinstance(source, int):
+            return source
+
+        # String source - look up from kwargs or args
+        if source in self._text_len_cache:
+            return self._text_len_cache[source]
+
+        # Try to get from kwargs/args
+        try:
+            val, _, _ = self.module_forward_metadata._get_parameter_from_args_kwargs(source, args, kwargs)
+            if val is None:
+                raise ValueError(f"Parameter '{source}' is None, cannot determine text length.")
+            if isinstance(val, torch.Tensor):
+                text_len = val.shape[0]  # Assume first dim is sequence length
+            elif isinstance(val, int):
+                text_len = val
+            else:
+                raise ValueError(f"Cannot determine text length from '{source}' of type {type(val).__name__}")
+            self._text_len_cache[source] = text_len
+            return text_len
+        except ValueError as e:
+            raise ValueError(f"Failed to resolve text_len_source '{source}': {e}") from e
+
+    def _prepare_cp_input(
+        self,
+        x: torch.Tensor,
+        cp_input: AnyContextParallelInput,
+        args: tuple = (),
+        kwargs: dict | None = None,
+    ) -> torch.Tensor:
         """Shard a tensor according to the input specification."""
+        kwargs = kwargs or {}
+
         if cp_input.expected_dims is not None and x.dim() != cp_input.expected_dims:
             logger.warning_once(f"Expected tensor with {cp_input.expected_dims} dims, got {x.dim()}. Skipping split.")
             return x
 
-        return cp_shard(x, cp_input.split_dim, validate=False)
+        if isinstance(cp_input, ContextParallelInput):
+            # Full split
+            return cp_shard(x, cp_input.split_dim, validate=False)
+        elif isinstance(cp_input, ContextParallelPartialInput):
+            # Partial split: keep text portion, split image portion
+            text_len = self._resolve_text_len(cp_input, args, kwargs)
+            dim = cp_input.split_dim
+
+            # Split tensor into text and image portions
+            text_part = x.narrow(dim, 0, text_len)
+            image_part = x.narrow(dim, text_len, x.size(dim) - text_len)
+
+            # Only shard the image portion
+            image_part_sharded = cp_shard(image_part, dim, validate=False)
+
+            # Concatenate back: [text_full, image_sharded]
+            return torch.cat([text_part, image_part_sharded], dim=dim)
+        else:
+            raise ValueError(f"Unsupported input config type: {type(cp_input).__name__}")
 
 
 class ContextParallelGatherHook(ModelHook):

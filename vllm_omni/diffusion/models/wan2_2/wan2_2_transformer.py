@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# _cp_plan definition adapted from HuggingFace diffusers library
+
 
 import math
 from collections.abc import Iterable
@@ -17,6 +19,7 @@ from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinea
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.distributed import ContextParallelInput, ContextParallelOutput
 
 logger = init_logger(__name__)
 
@@ -513,9 +516,40 @@ class WanTransformer3DModel(nn.Module):
         added_kv_proj_dim: Optional added KV projection dimension for I2V
         rope_max_seq_len: Maximum sequence length for rotary embeddings
         pos_embed_seq_len: Optional position embedding sequence length
+
+    Context Parallelism:
+        This model supports non-intrusive CP via _cp_plan. The plan specifies:
+        - RoPE output splitting (freqs_cos, freqs_sin) along sequence dimension
+        - hidden_states splitting at first transformer block
+        - Output gathering at proj_out layer
+
+        Note: encoder_hidden_states is NOT split because I2V mode generates a fixed
+        257 tokens for image_embed, making the total (512 + 257 = 769) indivisible
+        by typical CP world sizes.
     """
 
     _repeated_blocks = ["WanTransformerBlock"]
+
+    # Context Parallelism plan - adapted from diffusers WanTransformer3DModel
+    # Reference: https://github.com/huggingface/diffusers/pull/12909
+    _cp_plan = {
+        # Split RoPE embeddings output along sequence dimension (dim=1)
+        # rope() returns (freqs_cos, freqs_sin), each with shape (1, seq_len, 1, head_dim)
+        "rope": {
+            0: ContextParallelInput(split_dim=1, expected_dims=4, split_output=True),
+            1: ContextParallelInput(split_dim=1, expected_dims=4, split_output=True),
+        },
+        # Split hidden_states at first transformer block
+        # hidden_states shape: (batch, seq_len, hidden_dim)
+        "blocks.0": {
+            "hidden_states": ContextParallelInput(split_dim=1, expected_dims=3, split_output=False),
+        },
+        # Gather output at projection layer
+        "proj_out": ContextParallelOutput(gather_dim=1, expected_dims=3),
+        # Note: We intentionally do NOT split encoder_hidden_states because in I2V mode,
+        # image_encoder generates 257 tokens, making total (512 + 257 = 769) indivisible
+        # by typical CP world sizes (2, 4, 8).
+    }
 
     def __init__(
         self,

@@ -7,6 +7,7 @@ from vllm_omni.diffusion.distributed.cp_plan import (
     ContextParallelInput,
     ContextParallelModelPlan,
     ContextParallelOutput,
+    ContextParallelPartialInput,
     get_cp_plan_from_model,
     validate_cp_plan,
 )
@@ -26,6 +27,7 @@ __all__ = [
     # Plan types
     "ContextParallelInput",
     "ContextParallelOutput",
+    "ContextParallelPartialInput",
     "ContextParallelModelPlan",
     "validate_cp_plan",
     "get_cp_plan_from_model",

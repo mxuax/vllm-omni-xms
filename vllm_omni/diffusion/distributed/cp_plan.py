@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM and HuggingFace diffusers
+# Type definitions in this module are adapted from HuggingFace diffusers library:
+#   diffusers/src/diffusers/models/_modeling_parallel.py
 """Context Parallelism plan type definitions.
 
 This module defines the types used for declaring _cp_plan on model classes,
@@ -90,12 +92,64 @@ class ContextParallelOutput:
         return f"ContextParallelOutput(gather_dim={self.gather_dim}, expected_dims={self.expected_dims})"
 
 
+@dataclass(frozen=True)
+class ContextParallelPartialInput:
+    """Configuration for partially splitting a tensor (e.g., split image part, keep text part).
+
+    This is designed for models like LongCat/Qwen where RoPE embeddings need special handling:
+    - Text portion: kept full across all ranks (for joint attention)
+    - Image portion: split across ranks
+
+    The tensor is assumed to be concatenated as [text_part, image_part] along split_dim.
+
+    Args:
+        split_dim: The dimension along which to split the image portion.
+        text_len_source: How to determine text length:
+            - str: Name of a forward parameter that contains text length
+            - int: Fixed text length value
+        expected_dims: Expected number of dimensions for validation.
+        split_output: If True, split the output instead of input.
+
+    Example:
+        # Split RoPE: text portion (from txt_ids.shape[0]) kept full, image portion split
+        ContextParallelPartialInput(
+            split_dim=0,
+            text_len_source="txt_ids",  # Get text length from txt_ids.shape[0]
+            expected_dims=2,
+            split_output=True,
+        )
+
+        # Or with fixed text length
+        ContextParallelPartialInput(
+            split_dim=0,
+            text_len_source=512,  # Fixed text length
+            expected_dims=2,
+            split_output=True,
+        )
+    """
+
+    split_dim: int
+    text_len_source: str | int
+    expected_dims: int | None = None
+    split_output: bool = False
+
+    def __repr__(self) -> str:
+        return (
+            f"ContextParallelPartialInput(split_dim={self.split_dim}, "
+            f"text_len_source={self.text_len_source!r}, expected_dims={self.expected_dims}, "
+            f"split_output={self.split_output})"
+        )
+
+
 # Type aliases for _cp_plan structure
+
+# Any input config type
+AnyContextParallelInput = ContextParallelInput | ContextParallelPartialInput
 
 # Input specification: maps parameter names (str) or output indices (int) to split config
 ContextParallelInputType = dict[
     str | int,
-    ContextParallelInput | list[ContextParallelInput] | tuple[ContextParallelInput, ...],
+    AnyContextParallelInput | list[AnyContextParallelInput] | tuple[AnyContextParallelInput, ...],
 ]
 
 # Output specification: single or multiple gather configs
@@ -106,6 +160,18 @@ ContextParallelOutputType = ContextParallelOutput | list[ContextParallelOutput] 
 # - Key "module_name" refers to a submodule
 # - Key "module_name.*" refers to all children of a ModuleList
 ContextParallelModelPlan = dict[str, ContextParallelInputType | ContextParallelOutputType]
+
+
+def _is_valid_input_config(value: object) -> bool:
+    """Check if a value is a valid input configuration type."""
+    return isinstance(value, (ContextParallelInput, ContextParallelPartialInput))
+
+
+def _is_valid_input_config_list(value: object) -> bool:
+    """Check if a value is a list/tuple of valid input configurations."""
+    if not isinstance(value, (list, tuple)):
+        return False
+    return all(_is_valid_input_config(x) for x in value)
 
 
 def validate_cp_plan(plan: ContextParallelModelPlan) -> None:
@@ -130,7 +196,7 @@ def validate_cp_plan(plan: ContextParallelModelPlan) -> None:
         if isinstance(module_plan, (list, tuple)):
             if all(isinstance(x, ContextParallelOutput) for x in module_plan):
                 continue
-            if all(isinstance(x, ContextParallelInput) for x in module_plan):
+            if _is_valid_input_config_list(module_plan):
                 # List of inputs for a specific parameter (when output is tuple)
                 continue
 
@@ -141,26 +207,22 @@ def validate_cp_plan(plan: ContextParallelModelPlan) -> None:
                     raise ValueError(
                         f"Input spec keys must be str or int, got {type(key).__name__} for module '{module_id}'"
                     )
-                if isinstance(key, int) and not isinstance(value, ContextParallelInput):
+                if isinstance(key, int) and not _is_valid_input_config(value):
                     raise ValueError(
-                        f"Integer keys (output indices) must map to ContextParallelInput, "
+                        f"Integer keys (output indices) must map to ContextParallelInput/PartialInput, "
                         f"got {type(value).__name__} for module '{module_id}'[{key}]"
                     )
-                if isinstance(value, ContextParallelInput):
+                if _is_valid_input_config(value):
                     if isinstance(key, int) and not value.split_output:
                         raise ValueError(
                             f"Integer keys (output indices) require split_output=True, "
                             f"got split_output=False for module '{module_id}'[{key}]"
                         )
-                elif isinstance(value, (list, tuple)):
-                    if not all(isinstance(x, ContextParallelInput) for x in value):
-                        raise ValueError(
-                            f"List/tuple values must contain only ContextParallelInput, "
-                            f"got mixed types for module '{module_id}'['{key}']"
-                        )
+                elif _is_valid_input_config_list(value):
+                    pass  # Valid list of input configs
                 else:
                     raise ValueError(
-                        f"Input spec values must be ContextParallelInput or list thereof, "
+                        f"Input spec values must be ContextParallelInput/PartialInput or list thereof, "
                         f"got {type(value).__name__} for module '{module_id}'['{key}']"
                     )
         else:
