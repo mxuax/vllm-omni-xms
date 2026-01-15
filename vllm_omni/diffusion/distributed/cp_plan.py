@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM and HuggingFace diffusers
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM and The HuggingFace Team
 # Type definitions in this module are adapted from HuggingFace diffusers library:
 #   diffusers/src/diffusers/models/_modeling_parallel.py
 """Context Parallelism plan type definitions.

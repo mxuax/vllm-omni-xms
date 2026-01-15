@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project and The HuggingFace Team
 """Context Parallelism configuration for vLLM-Omni.
 
 This module provides configuration classes for Context Parallelism (CP),
