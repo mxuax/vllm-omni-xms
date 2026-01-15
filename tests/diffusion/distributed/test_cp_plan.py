@@ -176,13 +176,20 @@ class TestModelCpPlans:
             assert plan is not None, "ZImageTransformer2DModel should have _cp_plan"
             validate_cp_plan(plan)
 
-            # Check specific entries
+            # Check input splitting entries
             assert "layers.0" in plan
             layers_plan = plan["layers.0"]
             assert "x" in layers_plan
             assert "cos" in layers_plan
             assert "sin" in layers_plan
             assert "attn_mask" in layers_plan
+
+            # Check output gathering entry
+            assert "all_final_layer.2-1" in plan
+            final_layer_plan = plan["all_final_layer.2-1"]
+            assert isinstance(final_layer_plan, ContextParallelOutput)
+            assert final_layer_plan.gather_dim == 1
+            assert final_layer_plan.expected_dims == 3
         except ImportError:
             pytest.skip("ZImageTransformer2DModel not available")
 

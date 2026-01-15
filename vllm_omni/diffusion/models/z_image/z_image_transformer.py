@@ -33,7 +33,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.distributed import ContextParallelInput
+from vllm_omni.diffusion.distributed import ContextParallelInput, ContextParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
@@ -465,12 +465,16 @@ class ZImageTransformer2DModel(nn.Module):
         - Input splitting at first main transformer block (unified sequence)
         - RoPE (cos/sin) splitting along sequence dimension
         - Attention mask splitting along sequence dimension
+        - Output gathering at final_layer
 
         The CP is applied to the main `layers` transformer blocks where the
         unified image+caption sequence is processed jointly.
 
         Note: noise_refiner and context_refiner are NOT parallelized as they
         process image and caption separately before unification.
+
+        Important: The default _cp_plan assumes patch_size=2 and f_patch_size=1.
+        If using different patch configurations, update _cp_plan accordingly.
     """
 
     _repeated_blocks = ["ZImageTransformerBlock"]
@@ -489,10 +493,11 @@ class ZImageTransformer2DModel(nn.Module):
             "sin": ContextParallelInput(split_dim=1, expected_dims=3, split_output=False),
             "attn_mask": ContextParallelInput(split_dim=1, expected_dims=2, split_output=False),
         },
-        # Note: We don't gather at final_layer because:
-        # 1. final_layer is in ModuleDict (dynamically selected)
-        # 2. Output needs to be unpadded per-sample after gathering
-        # Instead, gathering should be done in the forward method or pipeline
+        # Gather output at final_layer (default: patch_size=2, f_patch_size=1)
+        # FinalLayer.forward returns: [batch, seq_len, out_channels]
+        # Note: If using different patch configs (e.g., patch_size=4), add:
+        #   "all_final_layer.4-1": ContextParallelOutput(gather_dim=1, expected_dims=3),
+        "all_final_layer.2-1": ContextParallelOutput(gather_dim=1, expected_dims=3),
     }
 
     def __init__(
