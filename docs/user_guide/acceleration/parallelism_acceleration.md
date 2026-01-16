@@ -268,28 +268,6 @@ class MyTransformer2DModel(nn.Module):
     }
 ```
 
-**Example: Simple model (Wan-style)**
-
-For models where RoPE is computed in a separate module, you can directly shard its outputs:
-
-```python
-# vllm_omni/diffusion/models/wan2_2/wan2_2_transformer.py
-class WanTransformer3DModel(nn.Module):
-    _cp_plan = {
-        # Shard RoPE outputs (cos, sin)
-        "rope": {
-            0: ContextParallelInput(split_dim=1, expected_dims=4, split_output=True),
-            1: ContextParallelInput(split_dim=1, expected_dims=4, split_output=True),
-        },
-        # Shard hidden_states input to first block
-        "blocks.0": {
-            "hidden_states": ContextParallelInput(split_dim=1, expected_dims=3),
-        },
-        # Gather at output projection
-        "proj_out": ContextParallelOutput(gather_dim=1, expected_dims=3),
-    }
-```
-
 **Example: Complex model requiring a preparation module (Qwen-Image / Z-Image)**
 
 For models where multiple tensors must be sharded **synchronously** (e.g., `hidden_states` and `vid_freqs` must match in sequence dimension), create a **preparation module** that outputs all tensors together:

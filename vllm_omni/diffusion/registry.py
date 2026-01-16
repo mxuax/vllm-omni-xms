@@ -3,6 +3,7 @@
 
 import importlib
 
+import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
 
@@ -96,7 +97,7 @@ DiffusionModelRegistry = _ModelRegistry(
 
 def initialize_model(
     od_config: OmniDiffusionConfig,
-):
+) -> nn.Module:
     """Initialize a diffusion model from the registry.
 
     This function:

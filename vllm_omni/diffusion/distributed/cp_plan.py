@@ -31,6 +31,10 @@ Example:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch.nn as nn
 
 
 @dataclass(frozen=True)
@@ -232,7 +236,7 @@ def validate_cp_plan(plan: ContextParallelModelPlan) -> None:
             )
 
 
-def get_cp_plan_from_model(model) -> ContextParallelModelPlan | None:
+def get_cp_plan_from_model(model: nn.Module) -> ContextParallelModelPlan | None:
     """Get the _cp_plan from a model if it exists.
 
     Args:
