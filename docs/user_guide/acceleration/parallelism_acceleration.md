@@ -210,25 +210,163 @@ To measure the parallelism methods, we run benchmarks with **Qwen/Qwen-Image** m
 
 ##### How to parallelize a new model
 
-If a diffusion model has been deployed in vLLM-Omni and supports single-card inference, you can refer to the following instructions to parallelize it with [Ulysses-SP](https://arxiv.org/pdf/2309.14509).
+If a diffusion model has been deployed in vLLM-Omni and supports single-card inference, you can enable Context Parallelism (CP) using one of two approaches:
+
+1. **Non-intrusive `_cp_plan` approach** (Recommended): Define a `_cp_plan` class attribute that declaratively specifies how tensors should be sharded/gathered. The framework automatically applies hooks to handle the parallelism.
+
+2. **Intrusive modification approach** (For complex cases): Manually add sharding/gathering logic in the model's `forward()` method.
+
+---
+
+###### Method 1: Non-intrusive `_cp_plan` (Recommended)
+
+The `_cp_plan` mechanism, inspired by the [diffusers library](https://github.com/huggingface/diffusers), allows you to enable CP without modifying the core `forward()` logic. The framework automatically:
+- Shards input tensors before computation
+- Configures Attention layers for Ulysses/Ring communication
+- Gathers output tensors after computation
+
+**Step 1: Understand the `_cp_plan` types**
+
+```python
+from vllm_omni.diffusion.distributed.cp_plan import (
+    ContextParallelInput,    # For sharding inputs
+    ContextParallelOutput,   # For gathering outputs
+)
+
+# ContextParallelInput: Shard a tensor along a dimension
+ContextParallelInput(
+    split_dim=1,           # Dimension to split (usually sequence dim)
+    expected_dims=3,       # Expected tensor rank (for validation)
+    split_output=False,    # If True, shard the module's OUTPUT instead of input
+)
+
+# ContextParallelOutput: Gather sharded outputs
+ContextParallelOutput(
+    gather_dim=1,          # Dimension to gather
+    expected_dims=3,       # Expected tensor rank
+)
+```
+
+**Step 2: Define `_cp_plan` for your model**
+
+The `_cp_plan` is a dictionary mapping module names to their sharding/gathering specifications:
+
+```python
+class MyTransformer2DModel(nn.Module):
+    _cp_plan = {
+        # Shard inputs to the first transformer block
+        "blocks.0": {
+            "hidden_states": ContextParallelInput(split_dim=1, expected_dims=3),
+        },
+        # If RoPE module outputs need sharding, use split_output=True
+        "rope": {
+            0: ContextParallelInput(split_dim=1, expected_dims=4, split_output=True),  # cos
+            1: ContextParallelInput(split_dim=1, expected_dims=4, split_output=True),  # sin
+        },
+        # Gather outputs at the final projection
+        "proj_out": ContextParallelOutput(gather_dim=1, expected_dims=3),
+    }
+```
+
+**Example: Simple model (Wan-style)**
+
+For models where RoPE is computed in a separate module, you can directly shard its outputs:
+
+```python
+# vllm_omni/diffusion/models/wan2_2/wan2_2_transformer.py
+class WanTransformer3DModel(nn.Module):
+    _cp_plan = {
+        # Shard RoPE outputs (cos, sin)
+        "rope": {
+            0: ContextParallelInput(split_dim=1, expected_dims=4, split_output=True),
+            1: ContextParallelInput(split_dim=1, expected_dims=4, split_output=True),
+        },
+        # Shard hidden_states input to first block
+        "blocks.0": {
+            "hidden_states": ContextParallelInput(split_dim=1, expected_dims=3),
+        },
+        # Gather at output projection
+        "proj_out": ContextParallelOutput(gather_dim=1, expected_dims=3),
+    }
+```
+
+**Example: Complex model requiring a preparation module (Qwen-Image / Z-Image)**
+
+For models where multiple tensors must be sharded **synchronously** (e.g., `hidden_states` and `vid_freqs` must match in sequence dimension), create a **preparation module** that outputs all tensors together:
+
+```python
+# Step 1: Create a preparation module
+class ImageRopePrepare(nn.Module):
+    """Encapsulates input projection and RoPE computation for _cp_plan sharding."""
+
+    def __init__(self, img_in: nn.Linear, pos_embed: nn.Module):
+        super().__init__()
+        self.img_in = img_in
+        self.pos_embed = pos_embed
+
+    def forward(self, hidden_states, img_shapes, txt_seq_lens):
+        hidden_states = self.img_in(hidden_states)
+        vid_freqs, txt_freqs = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
+        return hidden_states, vid_freqs, txt_freqs  # All outputs can be sharded together
 
 
-This section uses **Qwen-Image** (`QwenImageTransformer2DModel`) as the reference implementation. Qwen-Image is a **dual-stream** transformer (text + image) that performs **joint attention** across the concatenated sequences. Because of that, when enabling sequence parallel you typically:
+# Step 2: Define _cp_plan to shard the preparation module's outputs
+class QwenImageTransformer2DModel(nn.Module):
+    _cp_plan = {
+        "image_rope_prepare": {
+            0: ContextParallelInput(split_dim=1, expected_dims=3, split_output=True),  # hidden_states
+            1: ContextParallelInput(split_dim=0, expected_dims=2, split_output=True),  # vid_freqs
+            # txt_freqs (index 2) is NOT sharded - kept replicated for dual-stream attention
+        },
+        "proj_out": ContextParallelOutput(gather_dim=1, expected_dims=3),
+    }
 
-- Chunk **image tokens** (`hidden_states`) across SP ranks along the **sequence dimension**.
-- Keep **text embeddings** (`encoder_hidden_states`) **replicated** on all SP ranks for correctness (unless you implement full joint-SP semantics and explicitly split text too).
-- Chunk **image RoPE freqs** to match the chunked image tokens.
-- `all_gather` the final output back along the sequence dimension.
+    def __init__(self, ...):
+        ...
+        # Create the preparation module
+        self.image_rope_prepare = ImageRopePrepare(self.img_in, self.pos_embed)
 
-First, add the sequence-parallel helpers and (for Qwen-Image) the forward-context flag. Then, in the transformer's `forward()`:
+    def forward(self, hidden_states, ...):
+        # Use the preparation module - _cp_plan will automatically shard its outputs
+        hidden_states, vid_freqs, txt_freqs = self.image_rope_prepare(
+            hidden_states, img_shapes, txt_seq_lens
+        )
+        image_rotary_emb = (vid_freqs, txt_freqs)
+        ...
+```
 
-- Chunk `hidden_states` by SP world size.
-- Set `get_forward_context().split_text_embed_in_sp = False` because Qwen-Image uses joint attention and we would use a full text embedding in each rank.
-- After `pos_embed`, chunk `img_freqs` on `dim=0` (token axis) to match the chunked image tokens; only chunk `txt_freqs` if you explicitly split text embeddings in SP.
+**Step 3: The framework automatically applies CP**
 
-Taking `vllm_omni/diffusion/models/qwen_image/qwen_image_transformer.py` as an example:
+When the model is loaded with `sequence_parallel_size > 1`, the `registry.py` automatically:
+1. Detects the `_cp_plan` attribute
+2. Registers hooks to shard/gather tensors according to the plan
+3. Configures Attention layers for Ulysses/Ring communication
 
-```diff
+```python
+from vllm_omni import Omni
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+omni = Omni(
+    model="Qwen/Qwen-Image",
+    parallel_config=DiffusionParallelConfig(ulysses_degree=2)  # or ring_degree=2
+)
+
+outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50)
+```
+
+---
+
+###### Method 2: Intrusive modification (For highly complex cases)
+
+For models with unusual architectures that cannot be expressed via `_cp_plan`, you can manually add sharding logic. This approach requires:
+
+- Manually chunk tensors at the beginning of `forward()`
+- Set appropriate forward context flags
+- Manually `all_gather` outputs at the end
+
+**Example: Manual sharding in forward()**
+
+```python
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
@@ -236,74 +374,54 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 
-class QwenImageTransformer2DModel(...):
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor = None,
-        encoder_hidden_states_mask: torch.Tensor = None,
-        timestep: torch.LongTensor = None,
-        img_shapes: list[tuple[int, int, int]] | None = None,
-        txt_seq_lens: list[int] | None = None,
-        ...
-    ):
-+       if self.parallel_config.sequence_parallel_size > 1:
-+           # Chunk image tokens along sequence dimension.
-+           hidden_states = torch.chunk(
-+               hidden_states,
-+               get_sequence_parallel_world_size(),
-+               dim=-2,
-+           )[get_sequence_parallel_rank()]
-+
-+           # Qwen-Image uses *dual-stream* (text + image) and runs *joint attention*.
-+           # Text embeddings should be replicated across SP ranks for correctness.
-+           get_forward_context().split_text_embed_in_sp = False
+class ComplexTransformer2DModel(nn.Module):
+    def forward(self, hidden_states, encoder_hidden_states, ...):
+        sp_size = self.parallel_config.sequence_parallel_size
 
-        hidden_states = self.img_in(hidden_states)
+        if sp_size > 1:
+            sp_rank = get_sequence_parallel_rank()
+            sp_world_size = get_sequence_parallel_world_size()
 
-        ...
-        image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
+            # 1. Shard hidden_states along sequence dimension
+            hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
 
-+       def get_rotary_emb_chunk(freqs):
-+           return torch.chunk(freqs, get_sequence_parallel_world_size(), dim=0)[
-+               get_sequence_parallel_rank()
-+           ]
-+
-+       if self.parallel_config.sequence_parallel_size > 1:
-+           img_freqs, txt_freqs = image_rotary_emb
-+           img_freqs = get_rotary_emb_chunk(img_freqs)
-+           if get_forward_context().split_text_embed_in_sp:
-+               txt_freqs = get_rotary_emb_chunk(txt_freqs)
-+           image_rotary_emb = (img_freqs, txt_freqs)
-```
+            # 2. Set forward context for attention layers
+            # False = text embeddings are replicated (not sharded)
+            get_forward_context().split_text_embed_in_sp = False
 
-Next, at the end of the `forward()` function, call `get_sp_group().all_gather` to gather the chunked outputs across devices and concatenate them along the sequence dimension (matching the earlier `dim=-2` chunking):
+            # 3. Shard RoPE frequencies to match hidden_states
+            img_freqs, txt_freqs = self.pos_embed(...)
+            img_freqs = torch.chunk(img_freqs, sp_world_size, dim=0)[sp_rank]
+            # txt_freqs kept replicated for dual-stream attention
+            image_rotary_emb = (img_freqs, txt_freqs)
 
-```diff
-class QwenImageTransformer2DModel(...):
-    def forward(...):
-        ...
-        hidden_states = self.norm_out(hidden_states, temb)
+        # ... transformer blocks ...
+
         output = self.proj_out(hidden_states)
 
-+       if self.parallel_config.sequence_parallel_size > 1:
-+           output = get_sp_group().all_gather(output, dim=-2)
-        return Transformer2DModelOutput(sample=output)
+        if sp_size > 1:
+            # 4. Gather outputs from all ranks
+            output = get_sp_group().all_gather(output, dim=1)
+
+        return output
 ```
 
-Finally, you can set the parallel configuration and pass it to `Omni` and start parallel inference with:
-```diff
-from vllm_omni import Omni
-+from vllm_omni.diffusion.data import DiffusionParallelConfig
-ulysses_degree = 2
+**When to use intrusive modification:**
 
-omni = Omni(
-    model="Qwen/Qwen-Image",
-+    parallel_config=DiffusionParallelConfig(ulysses_degree=2)
-)
+- The model has dynamic sharding logic (e.g., different sharding based on input content)
+- Multiple tensors need complex interdependent sharding that can't be expressed as module outputs
+- The model requires custom communication patterns beyond simple shard/gather
 
-outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50)
-```
+---
+
+###### Summary: Choosing the right approach
+
+| Scenario | Recommended Approach |
+|----------|---------------------|
+| Standard transformer with RoPE module | `_cp_plan` with `split_output=True` on rope |
+| Dual-stream model (text + image) | Create preparation module + `_cp_plan` |
+| Model with complex dynamic sharding | Intrusive modification |
+| Rapid prototyping | Intrusive modification (then migrate to `_cp_plan`) |
 
 
 ### CFG-Parallel
