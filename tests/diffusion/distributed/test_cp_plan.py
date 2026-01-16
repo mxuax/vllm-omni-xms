@@ -197,8 +197,50 @@ class TestModelCpPlans:
         except ImportError:
             pytest.skip("ZImageTransformer2DModel not available")
 
+    def test_qwen_image_transformer_cp_plan(self):
+        """Test QwenImageTransformer2DModel _cp_plan structure.
 
-class MockShardingTest:
+        Qwen-Image follows the diffusers pattern similar to Z-Image:
+        - image_rope_prepare: Shards hidden_states and vid_freqs together
+        - proj_out: Gathers output
+
+        Key insight: hidden_states and vid_freqs MUST be sharded together
+        to maintain dimension alignment for RoPE computation.
+        """
+        try:
+            from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
+                QwenImageTransformer2DModel,
+            )
+
+            plan = getattr(QwenImageTransformer2DModel, "_cp_plan", None)
+            assert plan is not None, "QwenImageTransformer2DModel should define _cp_plan"
+            assert isinstance(plan, dict)
+
+            # Check image_rope_prepare sharding
+            assert "image_rope_prepare" in plan
+            rope_plan = plan["image_rope_prepare"]
+            # hidden_states (index 0)
+            assert 0 in rope_plan
+            assert rope_plan[0].split_dim == 1
+            assert rope_plan[0].split_output is True
+            # vid_freqs (index 1)
+            assert 1 in rope_plan
+            assert rope_plan[1].split_dim == 0
+            assert rope_plan[1].split_output is True
+            # txt_freqs (index 2) should NOT be in plan (kept replicated)
+            assert 2 not in rope_plan
+
+            # Check output gathering at proj_out
+            assert "proj_out" in plan
+            proj_out_plan = plan["proj_out"]
+            assert proj_out_plan.gather_dim == 1
+
+            validate_cp_plan(plan)
+        except ImportError:
+            pytest.skip("QwenImageTransformer2DModel not available")
+
+
+class TestMockSharding:
     """Test tensor sharding logic (mocked, no distributed)."""
 
     def test_shard_tensor_simulation(self):
@@ -251,48 +293,6 @@ class MockShardingTest:
         expected_len = text_len + image_len // world_size
         assert result.shape == (batch_size, expected_len, hidden_dim)
         assert result.shape == (2, 8 + 4, 64)  # text_len + image_len/4
-
-    def test_qwen_image_transformer_cp_plan(self):
-        """Test QwenImageTransformer2DModel _cp_plan structure.
-
-        Qwen-Image follows the diffusers pattern similar to Z-Image:
-        - image_rope_prepare: Shards hidden_states and vid_freqs together
-        - proj_out: Gathers output
-
-        Key insight: hidden_states and vid_freqs MUST be sharded together
-        to maintain dimension alignment for RoPE computation.
-        """
-        try:
-            from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
-                QwenImageTransformer2DModel,
-            )
-
-            plan = getattr(QwenImageTransformer2DModel, "_cp_plan", None)
-            assert plan is not None, "QwenImageTransformer2DModel should define _cp_plan"
-            assert isinstance(plan, dict)
-
-            # Check image_rope_prepare sharding
-            assert "image_rope_prepare" in plan
-            rope_plan = plan["image_rope_prepare"]
-            # hidden_states (index 0)
-            assert 0 in rope_plan
-            assert rope_plan[0].split_dim == 1
-            assert rope_plan[0].split_output is True
-            # vid_freqs (index 1)
-            assert 1 in rope_plan
-            assert rope_plan[1].split_dim == 0
-            assert rope_plan[1].split_output is True
-            # txt_freqs (index 2) should NOT be in plan (kept replicated)
-            assert 2 not in rope_plan
-
-            # Check output gathering at proj_out
-            assert "proj_out" in plan
-            proj_out_plan = plan["proj_out"]
-            assert proj_out_plan.gather_dim == 1
-
-            validate_cp_plan(plan)
-        except ImportError:
-            pytest.skip("QwenImageTransformer2DModel not available")
 
 
 if __name__ == "__main__":
