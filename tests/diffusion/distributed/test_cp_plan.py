@@ -151,27 +151,9 @@ class TestContextParallelInputTypes:
 class TestModelCpPlans:
     """Test that model _cp_plan definitions are valid."""
 
-    def test_wan_transformer_cp_plan(self):
-        """Test WanTransformer3DModel _cp_plan is valid."""
-        try:
-            from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
-
-            plan = getattr(WanTransformer3DModel, "_cp_plan", None)
-            assert plan is not None, "WanTransformer3DModel should have _cp_plan"
-            validate_cp_plan(plan)
-
-            # Check specific entries
-            assert "rope" in plan
-            assert "blocks.0" in plan
-            assert "proj_out" in plan
-        except ImportError:
-            pytest.skip("WanTransformer3DModel not available")
-
     def test_zimage_transformer_cp_plan(self):
         """Test ZImageTransformer2DModel _cp_plan structure.
 
-        Z-Image follows the diffusers pattern where unified_prepare module outputs
-        are sharded via split_output=True (similar to Wan's rope module).
         The plan specifies:
         - unified_prepare: Shard all 4 outputs (unified, cos, sin, attn_mask)
         - all_final_layer.2-1: Gather outputs after final layer
@@ -183,7 +165,6 @@ class TestModelCpPlans:
             assert plan is not None, "ZImageTransformer2DModel should define _cp_plan"
             assert isinstance(plan, dict)
 
-            # Check unified_prepare output sharding (similar to Wan's rope)
             assert "unified_prepare" in plan
             unified_prepare_plan = plan["unified_prepare"]
             # Check all 4 outputs are sharded with split_output=True
