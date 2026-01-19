@@ -375,17 +375,6 @@ class SequenceParallelSplitHook(ModelHook):
         pad_size = world_size - remainder
         padded_seq_len = seq_len + pad_size
 
-        # Create attention mask (True = valid, False = padding)
-        batch_size = x.size(0) if dim != 0 else 1
-        if dim == 0:
-            # For unbatched tensors like RoPE
-            attention_mask = torch.ones(padded_seq_len, dtype=torch.bool, device=x.device)
-            attention_mask[seq_len:] = False
-        else:
-            # For batched tensors
-            attention_mask = torch.ones(batch_size, padded_seq_len, dtype=torch.bool, device=x.device)
-            attention_mask[:, seq_len:] = False
-
         # Pad the tensor
         pad_shape = list(x.shape)
         pad_shape[dim] = pad_size
@@ -393,15 +382,29 @@ class SequenceParallelSplitHook(ModelHook):
         x_padded = torch.cat([x, padding], dim=dim)
 
         # Store mask and padding info in forward context
+        # Only create attention mask for batched tensors (dim != 0) to avoid
+        # overwriting with RoPE tensors which have different shapes
         if is_forward_context_available():
             ctx = get_forward_context()
-            ctx.sp_attention_mask = attention_mask
-            ctx.sp_padding_size = pad_size
-            ctx.sp_original_seq_len = seq_len
-            logger.debug(
-                f"Auto-padded sequence from {seq_len} to {padded_seq_len} "
-                f"(pad_size={pad_size}, world_size={world_size})"
-            )
+            # Only set mask if not already set (first auto_pad tensor wins)
+            # or if this is a batched tensor (higher priority than unbatched)
+            if ctx.sp_attention_mask is None or (dim != 0 and ctx.sp_attention_mask.dim() == 1):
+                if dim == 0:
+                    # For unbatched tensors like RoPE - 1D mask
+                    attention_mask = torch.ones(padded_seq_len, dtype=torch.bool, device=x.device)
+                    attention_mask[seq_len:] = False
+                else:
+                    # For batched tensors - 2D mask [batch, seq]
+                    batch_size = x.size(0)
+                    attention_mask = torch.ones(batch_size, padded_seq_len, dtype=torch.bool, device=x.device)
+                    attention_mask[:, seq_len:] = False
+                ctx.sp_attention_mask = attention_mask
+                ctx.sp_padding_size = pad_size
+                ctx.sp_original_seq_len = seq_len
+                logger.debug(
+                    f"Auto-padded sequence from {seq_len} to {padded_seq_len} "
+                    f"(pad_size={pad_size}, world_size={world_size}, dim={dim})"
+                )
 
         # Shard the padded tensor
         rank = get_sequence_parallel_rank()
