@@ -434,23 +434,9 @@ class QwenImageCrossAttention(nn.Module):
             ctx = get_forward_context()
             if ctx.sp_attention_mask is not None:
                 # sp_attention_mask is for the full (padded) sequence
-                # We need to shard it to match the current rank's portion
-                from vllm_omni.diffusion.distributed.parallel_state import (
-                    get_sequence_parallel_rank,
-                    get_sequence_parallel_world_size,
-                )
-
-                sp_mask = ctx.sp_attention_mask
-                world_size = get_sequence_parallel_world_size()
-                rank = get_sequence_parallel_rank()
-
-                # Shard the mask to match current rank's hidden_states
-                if sp_mask.dim() == 2:
-                    # Batched mask: [batch, seq_len]
-                    hidden_states_mask = sp_mask.chunk(world_size, dim=1)[rank]
-                else:
-                    # Unbatched mask: [seq_len]
-                    hidden_states_mask = sp_mask.chunk(world_size, dim=0)[rank]
+                # In Ulysses mode, attention is computed on the FULL sequence
+                # (after All-to-All), so we use the full mask without sharding
+                hidden_states_mask = ctx.sp_attention_mask
 
         # if mask is all true, set it to None
         if hidden_states_mask is not None and hidden_states_mask.all():
