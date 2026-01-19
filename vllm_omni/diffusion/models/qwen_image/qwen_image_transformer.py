@@ -424,6 +424,34 @@ class QwenImageCrossAttention(nn.Module):
         hidden_states_mask: torch.Tensor | None = None,
         encoder_hidden_states_mask: torch.Tensor | None = None,
     ):
+        # Check for SP attention mask from auto_pad
+        # This handles variable sequence lengths that were padded for SP
+        if (
+            self.parallel_config is not None
+            and self.parallel_config.sequence_parallel_size > 1
+            and hidden_states_mask is None
+        ):
+            ctx = get_forward_context()
+            if ctx.sp_attention_mask is not None:
+                # sp_attention_mask is for the full (padded) sequence
+                # We need to shard it to match the current rank's portion
+                from vllm_omni.diffusion.distributed.parallel_state import (
+                    get_sequence_parallel_rank,
+                    get_sequence_parallel_world_size,
+                )
+
+                sp_mask = ctx.sp_attention_mask
+                world_size = get_sequence_parallel_world_size()
+                rank = get_sequence_parallel_rank()
+
+                # Shard the mask to match current rank's hidden_states
+                if sp_mask.dim() == 2:
+                    # Batched mask: [batch, seq_len]
+                    hidden_states_mask = sp_mask.chunk(world_size, dim=1)[rank]
+                else:
+                    # Unbatched mask: [seq_len]
+                    hidden_states_mask = sp_mask.chunk(world_size, dim=0)[rank]
+
         # if mask is all true, set it to None
         if hidden_states_mask is not None and hidden_states_mask.all():
             hidden_states_mask = None
@@ -650,7 +678,7 @@ class QwenImageTransformerBlock(nn.Module):
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
         # Process image stream - norm1 + modulation
-        img_modulated, img_gate1 = self.img_norm1(hidden_states, img_mod1)
+        img_modulated, img_gate1 = self.img_norm1(hidden_states, img_mod1, modulate_index)
 
         # Process text stream - norm1 + modulation
         txt_modulated, txt_gate1 = self.txt_norm1(encoder_hidden_states, txt_mod1)
@@ -678,7 +706,8 @@ class QwenImageTransformerBlock(nn.Module):
         encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
 
         # Process image stream - norm2 + MLP
-        img_modulated2, img_gate2 = self.img_norm2(hidden_states, img_mod2)
+        img_modulated2, img_gate2 = self.img_norm2(hidden_states, img_mod2, modulate_index)
+
         img_mlp_output = self.img_mlp(img_modulated2)
         hidden_states = hidden_states + img_gate2 * img_mlp_output
 
@@ -735,12 +764,18 @@ class QwenImageTransformer2DModel(CachedTransformer):
     # Key insight: hidden_states and vid_freqs MUST be sharded together to maintain
     # dimension alignment for RoPE computation in attention layers.
     #
+    # auto_pad=True enables automatic padding when sequence length is not divisible
+    # by SP world size. This creates an attention mask stored in ForwardContext
+    # that attention layers can use to ignore padding positions.
+    #
     # Note: _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism)
     _sp_plan = {
         # Shard ImageRopePrepare outputs (hidden_states and vid_freqs must be sharded together)
         "image_rope_prepare": {
-            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),  # hidden_states
-            1: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True),  # vid_freqs
+            # hidden_states: auto_pad=True for variable sequence length support
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            # vid_freqs: auto_pad=True to match hidden_states padding
+            1: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
             # txt_freqs (index 2) is NOT sharded - kept replicated for dual-stream attention
         },
         # Gather output at proj_out
@@ -757,15 +792,13 @@ class QwenImageTransformer2DModel(CachedTransformer):
         attention_head_dim: int = 128,
         num_attention_heads: int = 24,
         joint_attention_dim: int = 3584,
-        guidance_embeds: bool = False,  # TODO: this should probably be removed
+        guidance_embeds: bool = False,
         axes_dims_rope: tuple[int, int, int] = (16, 56, 56),
         zero_cond_t: bool = False,
         use_additional_t_cond: bool = False,
         use_layer3d_rope: bool = False,
     ):
         super().__init__()
-        model_config = od_config.tf_model_config
-        num_layers = model_config.num_layers
         self.parallel_config = od_config.parallel_config
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
@@ -850,6 +883,12 @@ class QwenImageTransformer2DModel(CachedTransformer):
         #     lora_scale = attention_kwargs.pop("scale", 1.0)
         # else:
         #     lora_scale = 1.0
+
+        # Set split_text_embed_in_sp = False for dual-stream attention
+        # QwenImage uses *dual-stream* (text + image) and runs a *joint attention*.
+        # Text embeddings must be replicated across SP ranks for correctness.
+        if self.parallel_config.sequence_parallel_size > 1:
+            get_forward_context().split_text_embed_in_sp = False
 
         # Prepare hidden_states and RoPE via ImageRopePrepare module
         # _sp_plan will shard hidden_states and vid_freqs together via split_output=True

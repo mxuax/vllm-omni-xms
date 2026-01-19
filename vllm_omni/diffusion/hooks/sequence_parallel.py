@@ -303,7 +303,9 @@ class SequenceParallelSplitHook(ModelHook):
             return x
 
         if isinstance(sp_input, SequenceParallelInput):
-            # Full split
+            # Full split with optional auto-padding
+            if sp_input.auto_pad:
+                return self._shard_with_auto_pad(x, sp_input.split_dim)
             return sp_shard(x, sp_input.split_dim, validate=False)
         elif isinstance(sp_input, SequenceParallelPartialInput):
             # Partial split: keep text portion, split image portion
@@ -321,6 +323,89 @@ class SequenceParallelSplitHook(ModelHook):
             return torch.cat([text_part, image_part_sharded], dim=dim)
         else:
             raise ValueError(f"Unsupported input config type: {type(sp_input).__name__}")
+
+    def _shard_with_auto_pad(self, x: torch.Tensor, dim: int) -> torch.Tensor:
+        """Shard tensor with automatic padding and attention mask creation.
+
+        When sequence length is not divisible by SP world size, this method:
+        1. Pads the tensor to make it divisible
+        2. Creates an attention mask indicating valid vs padding positions
+        3. Stores the mask and padding info in ForwardContext
+        """
+        from vllm_omni.diffusion.attention.selector import (
+            _BACKENDS_SUPPORT_ATTENTION_MASK,
+            get_attn_backend,
+        )
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_ring_parallel_world_size,
+            get_sequence_parallel_rank,
+            get_sequence_parallel_world_size,
+        )
+        from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
+        world_size = get_sequence_parallel_world_size()
+        if world_size == 1:
+            return x
+
+        seq_len = x.size(dim)
+        remainder = seq_len % world_size
+
+        if remainder == 0:
+            # No padding needed
+            return sp_shard(x, dim, validate=False)
+
+        # Check backend compatibility
+        attn_backend = get_attn_backend(-1)
+        if attn_backend.get_name() not in _BACKENDS_SUPPORT_ATTENTION_MASK:
+            raise ValueError(
+                f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "
+                f"Cannot use {attn_backend.get_name()} which does not support attention_mask. "
+                f"Please switch to SDPA or Ascend attention backend."
+            )
+
+        # Ring attention does not support attention_mask
+        if get_ring_parallel_world_size() > 1:
+            raise ValueError(
+                f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "
+                f"Cannot use Ring attention which does not support attention_mask. "
+                f"Please switch to Ulysses SP only."
+            )
+
+        # Calculate padding
+        pad_size = world_size - remainder
+        padded_seq_len = seq_len + pad_size
+
+        # Create attention mask (True = valid, False = padding)
+        batch_size = x.size(0) if dim != 0 else 1
+        if dim == 0:
+            # For unbatched tensors like RoPE
+            attention_mask = torch.ones(padded_seq_len, dtype=torch.bool, device=x.device)
+            attention_mask[seq_len:] = False
+        else:
+            # For batched tensors
+            attention_mask = torch.ones(batch_size, padded_seq_len, dtype=torch.bool, device=x.device)
+            attention_mask[:, seq_len:] = False
+
+        # Pad the tensor
+        pad_shape = list(x.shape)
+        pad_shape[dim] = pad_size
+        padding = torch.zeros(pad_shape, dtype=x.dtype, device=x.device)
+        x_padded = torch.cat([x, padding], dim=dim)
+
+        # Store mask and padding info in forward context
+        if is_forward_context_available():
+            ctx = get_forward_context()
+            ctx.sp_attention_mask = attention_mask
+            ctx.sp_padding_size = pad_size
+            ctx.sp_original_seq_len = seq_len
+            logger.debug(
+                f"Auto-padded sequence from {seq_len} to {padded_seq_len} "
+                f"(pad_size={pad_size}, world_size={world_size})"
+            )
+
+        # Shard the padded tensor
+        rank = get_sequence_parallel_rank()
+        return x_padded.chunk(world_size, dim=dim)[rank]
 
 
 class SequenceParallelGatherHook(ModelHook):
@@ -348,7 +433,9 @@ class SequenceParallelGatherHook(ModelHook):
         return module
 
     def post_forward(self, module: nn.Module, output: Any) -> Any:
-        """Gather outputs after forward."""
+        """Gather outputs after forward and remove padding if applied."""
+        from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
         is_tensor = isinstance(output, torch.Tensor)
 
         if is_tensor:
@@ -361,6 +448,12 @@ class SequenceParallelGatherHook(ModelHook):
         if len(output) != len(self.metadata):
             raise ValueError(f"Expected {len(self.metadata)} outputs, got {len(output)}.")
 
+        # Check if padding was applied during split
+        original_seq_len = None
+        if is_forward_context_available():
+            ctx = get_forward_context()
+            original_seq_len = ctx.sp_original_seq_len
+
         for i, spm in enumerate(self.metadata):
             if spm is None:
                 continue
@@ -372,7 +465,15 @@ class SequenceParallelGatherHook(ModelHook):
                 )
                 continue
 
-            output[i] = sp_gather(x, spm.gather_dim, validate=False)
+            # Gather from all ranks
+            gathered = sp_gather(x, spm.gather_dim, validate=False)
+
+            # Remove padding if it was applied
+            if original_seq_len is not None and gathered.size(spm.gather_dim) > original_seq_len:
+                gathered = gathered.narrow(spm.gather_dim, 0, original_seq_len)
+                logger.debug(f"Removed padding: gathered shape {gathered.shape} (original_seq_len={original_seq_len})")
+
+            output[i] = gathered
 
         return output[0] if is_tensor else type(output)(output)
 

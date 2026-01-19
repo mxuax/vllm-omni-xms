@@ -57,6 +57,11 @@ class SequenceParallelInput:
         split_output: If True, split the output of the layer instead of the input.
             This is useful for layers whose outputs should be split after preprocessing
             (e.g., RoPE embeddings).
+        auto_pad: If True, automatically pad the tensor if its size along split_dim
+            is not divisible by world_size. Creates an attention mask to indicate
+            valid vs padding positions. The mask is stored in ForwardContext.
+            Note: Ring attention does not support attention mask, so auto_pad
+            should only be used with Ulysses SP.
 
     Example:
         # Split hidden_states along sequence dimension (dim 1)
@@ -64,16 +69,21 @@ class SequenceParallelInput:
 
         # Split RoPE output along sequence dimension (dim 0)
         SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True)
+
+        # Split with auto-padding for variable-length sequences
+        SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True)
     """
 
     split_dim: int
     expected_dims: int | None = None
     split_output: bool = False
+    auto_pad: bool = False
 
     def __repr__(self) -> str:
         return (
             f"SequenceParallelInput(split_dim={self.split_dim}, "
-            f"expected_dims={self.expected_dims}, split_output={self.split_output})"
+            f"expected_dims={self.expected_dims}, split_output={self.split_output}, "
+            f"auto_pad={self.auto_pad})"
         )
 
 
