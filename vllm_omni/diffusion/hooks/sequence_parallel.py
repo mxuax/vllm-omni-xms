@@ -381,24 +381,12 @@ class SequenceParallelSplitHook(ModelHook):
         padding = torch.zeros(pad_shape, dtype=x.dtype, device=x.device)
         x_padded = torch.cat([x, padding], dim=dim)
 
-        # Store mask and padding info in forward context
-        # Only create attention mask for batched tensors (dim != 0) to avoid
-        # overwriting with RoPE tensors which have different shapes
+        # Store padding info in forward context (only once, for primary tensor)
+        # Attention layers will create masks dynamically using this info
         if is_forward_context_available():
             ctx = get_forward_context()
-            # Only set mask if not already set (first auto_pad tensor wins)
-            # or if this is a batched tensor (higher priority than unbatched)
-            if ctx.sp_attention_mask is None or (dim != 0 and ctx.sp_attention_mask.dim() == 1):
-                if dim == 0:
-                    # For unbatched tensors like RoPE - 1D mask
-                    attention_mask = torch.ones(padded_seq_len, dtype=torch.bool, device=x.device)
-                    attention_mask[seq_len:] = False
-                else:
-                    # For batched tensors - 2D mask [batch, seq]
-                    batch_size = x.size(0)
-                    attention_mask = torch.ones(batch_size, padded_seq_len, dtype=torch.bool, device=x.device)
-                    attention_mask[:, seq_len:] = False
-                ctx.sp_attention_mask = attention_mask
+            # Only set if not already set (first auto_pad tensor wins)
+            if ctx.sp_original_seq_len is None:
                 ctx.sp_padding_size = pad_size
                 ctx.sp_original_seq_len = seq_len
                 logger.debug(
