@@ -281,7 +281,3 @@ class TestMockSharding:
         expected_len = text_len + image_len // world_size
         assert result.shape == (batch_size, expected_len, hidden_dim)
         assert result.shape == (2, 8 + 4, 64)  # text_len + image_len/4
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

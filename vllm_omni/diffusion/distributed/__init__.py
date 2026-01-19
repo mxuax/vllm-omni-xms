@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Distributed utilities for vLLM-Omni diffusion models.
-
-NOTE: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
-We use the term "Sequence Parallelism" to align with vLLM-Omni's existing terminology.
-"""
+"""Distributed utilities for vLLM-Omni diffusion models."""
 
 from vllm_omni.diffusion.distributed.sp_config import SequenceParallelConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
