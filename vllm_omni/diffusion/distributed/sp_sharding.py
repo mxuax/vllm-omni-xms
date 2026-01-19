@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
 
 import torch
 from vllm.logger import init_logger
@@ -143,6 +142,16 @@ def sp_shard_with_padding(
     return sp_shard(tensor, dim, validate=False), pad_size
 
 
+# NOTE: This class is NOT from diffusers. It is a vLLM-Omni extension for
+# debugging intrusive SP implementations.
+# Purpose:
+# - Help developers detect bugs when implementing intrusive SP
+# - Verify that every sharded tensor is properly gathered
+# - Warn about common mistakes (double shard, gather without shard)
+#
+# When to use:
+# - During development/debugging of intrusive SP code
+# - In tests to verify shard/gather correctness
 @dataclass
 class ShardingValidator:
     """Validator for tracking and verifying sharding operations.
@@ -257,45 +266,3 @@ def get_sharding_validator() -> ShardingValidator:
         The global ShardingValidator.
     """
     return _global_validator
-
-
-class AllGatherFunction(torch.autograd.Function):
-    """Autograd function for all_gather with proper gradient handling.
-
-    This function performs all_gather in the forward pass and reduces
-    gradients in the backward pass to maintain gradient correctness
-    during training.
-    """
-
-    @staticmethod
-    def forward(
-        ctx: Any,
-        tensor: torch.Tensor,
-        dim: int,
-    ) -> torch.Tensor:
-        ctx.dim = dim
-        ctx.world_size = get_sequence_parallel_world_size()
-        ctx.rank = get_sequence_parallel_rank()
-        return sp_gather(tensor, dim, validate=False)
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
-        # Split gradient back to get local portion
-        grad_chunks = torch.chunk(grad_output, ctx.world_size, dim=ctx.dim)
-        return grad_chunks[ctx.rank].contiguous(), None
-
-
-def sp_gather_with_grad(tensor: torch.Tensor, dim: int) -> torch.Tensor:
-    """Gather tensor with proper gradient handling for training.
-
-    Use this instead of sp_gather when gradients need to flow back
-    correctly during training.
-
-    Args:
-        tensor: The local shard to gather.
-        dim: The dimension along which to gather.
-
-    Returns:
-        The gathered tensor (autograd-enabled).
-    """
-    return AllGatherFunction.apply(tensor, dim)

@@ -42,9 +42,9 @@ import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.distributed.sp_config import SequenceParallelConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     AnySequenceParallelInput,
+    SequenceParallelConfig,
     SequenceParallelInput,
     SequenceParallelModelPlan,
     SequenceParallelOutput,
@@ -278,7 +278,10 @@ class SequenceParallelSplitHook(ModelHook):
             if val is None:
                 raise ValueError(f"Parameter '{source}' is None, cannot determine text length.")
             if isinstance(val, torch.Tensor):
-                text_len = val.shape[0]  # Assume first dim is sequence length
+                # TODO: Currently assumes batch_size=1, where shape[0] is sequence length.
+                # For batch inference support, this should be updated to handle
+                # shape (batch_size, seq_len, ...) where text_len varies per sample.
+                text_len = val.shape[0]
             elif isinstance(val, int):
                 text_len = val
             else:

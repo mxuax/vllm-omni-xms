@@ -8,8 +8,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.sp_config import SequenceParallelConfig
-from vllm_omni.diffusion.distributed.sp_plan import get_sp_plan_from_model
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
 
 logger = init_logger(__name__)
