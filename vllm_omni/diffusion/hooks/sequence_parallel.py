@@ -5,25 +5,28 @@
 # This module is adapted from HuggingFace diffusers library:
 #   diffusers/src/diffusers/hooks/context_parallel.py
 #
+# NOTE: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
+# We use the term "Sequence Parallelism" to align with vLLM-Omni's existing terminology.
+#
 # Key adaptations from diffusers:
 #   - ModuleForwardMetadata: parameter lookup logic (adapted)
-#   - ContextParallelSplitHook/GatherHook: hook structure (adapted)
-#   - apply_context_parallel: registration logic (adapted)
+#   - SequenceParallelSplitHook/GatherHook: hook structure (adapted from ContextParallel*)
+#   - apply_sequence_parallel: registration logic (adapted from apply_context_parallel)
 #
 # Key differences from diffusers:
 #   - Uses vLLM-Omni's SequenceParallelGroupCoordinator instead of DeviceMesh
-#   - Uses cp_shard/cp_gather from cp_sharding.py instead of funcol operations
+#   - Uses sp_shard/sp_gather from sp_sharding.py instead of funcol operations
 #   - Supports Ulysses + Ring hybrid parallelism
 #
-"""Context Parallelism hooks for non-intrusive CP support.
+"""Sequence Parallelism hooks for non-intrusive SP support.
 
-This module implements the hook-based mechanism for applying context parallelism
+This module implements the hook-based mechanism for applying sequence parallelism
 to models without modifying their forward() methods.
 
 Usage:
-    1. Define _cp_plan on your model class
-    2. Call apply_context_parallel(model, config, plan) to enable CP
-    3. Call remove_context_parallel(model, plan) to disable CP
+    1. Define _sp_plan on your model class (corresponds to diffusers' _cp_plan)
+    2. Call apply_sequence_parallel(model, config, plan) to enable SP
+    3. Call remove_sequence_parallel(model, plan) to disable SP
 
 The hooks automatically shard inputs before forward and gather outputs after,
 based on the plan specification.
@@ -39,22 +42,22 @@ import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.distributed.cp_config import ContextParallelConfig
-from vllm_omni.diffusion.distributed.cp_plan import (
-    AnyContextParallelInput,
-    ContextParallelInput,
-    ContextParallelModelPlan,
-    ContextParallelOutput,
-    ContextParallelPartialInput,
+from vllm_omni.diffusion.distributed.sp_config import SequenceParallelConfig
+from vllm_omni.diffusion.distributed.sp_plan import (
+    AnySequenceParallelInput,
+    SequenceParallelInput,
+    SequenceParallelModelPlan,
+    SequenceParallelOutput,
+    SequenceParallelPartialInput,
 )
-from vllm_omni.diffusion.distributed.cp_sharding import cp_gather, cp_shard
+from vllm_omni.diffusion.distributed.sp_sharding import sp_gather, sp_shard
 from vllm_omni.diffusion.hooks.base import HookRegistry, ModelHook
 
 logger = init_logger(__name__)
 
-# Hook name templates for identifying CP hooks
-_CP_INPUT_HOOK_TEMPLATE = "cp_input---{}"
-_CP_OUTPUT_HOOK_TEMPLATE = "cp_output---{}"
+# Hook name templates for identifying SP hooks
+_SP_INPUT_HOOK_TEMPLATE = "sp_input---{}"
+_SP_OUTPUT_HOOK_TEMPLATE = "sp_output---{}"
 
 
 @dataclass
@@ -143,24 +146,26 @@ def _unwrap_module(module: nn.Module) -> nn.Module:
     return module
 
 
-class ContextParallelSplitHook(ModelHook):
+class SequenceParallelSplitHook(ModelHook):
     """Hook for splitting inputs before a module's forward pass.
 
     This hook is registered to modules that need their inputs sharded
-    across context parallel ranks. It intercepts the forward call,
+    across sequence parallel ranks. It intercepts the forward call,
     shards specified inputs according to the plan, and passes the
     sharded inputs to the original forward.
 
     For split_output=True inputs, it shards the output instead.
 
-    Supports both ContextParallelInput (full split) and ContextParallelPartialInput
+    Supports both SequenceParallelInput (full split) and SequenceParallelPartialInput
     (partial split for text/image separation).
+
+    Note: This corresponds to `ContextParallelSplitHook` in diffusers.
     """
 
     def __init__(
         self,
-        metadata: dict[str | int, AnyContextParallelInput | list[AnyContextParallelInput]],
-        config: ContextParallelConfig,
+        metadata: dict[str | int, AnySequenceParallelInput | list[AnySequenceParallelInput]],
+        config: SequenceParallelConfig,
     ) -> None:
         super().__init__()
         self.metadata = metadata
@@ -180,9 +185,9 @@ class ContextParallelSplitHook(ModelHook):
         # Clear text length cache for this forward pass
         self._text_len_cache.clear()
 
-        for name, cpm in self.metadata.items():
+        for name, spm in self.metadata.items():
             # Skip if this is a split_output entry (handled in post_forward)
-            if isinstance(cpm, (ContextParallelInput, ContextParallelPartialInput)) and cpm.split_output:
+            if isinstance(spm, (SequenceParallelInput, SequenceParallelPartialInput)) and spm.split_output:
                 continue
 
             # Get the parameter value
@@ -195,20 +200,20 @@ class ContextParallelSplitHook(ModelHook):
 
             # Shard the input
             if isinstance(input_val, torch.Tensor):
-                input_val = self._prepare_cp_input(input_val, cpm, args_list, kwargs)
+                input_val = self._prepare_sp_input(input_val, spm, args_list, kwargs)
             elif isinstance(input_val, (list, tuple)):
                 # Handle list/tuple of tensors with per-element config
-                if not isinstance(cpm, (list, tuple)):
+                if not isinstance(spm, (list, tuple)):
                     raise ValueError(
-                        f"Expected list/tuple of ContextParallelInput for parameter '{name}' "
-                        f"which is a list/tuple, but got {type(cpm).__name__}"
+                        f"Expected list/tuple of SequenceParallelInput for parameter '{name}' "
+                        f"which is a list/tuple, but got {type(spm).__name__}"
                     )
-                if len(input_val) != len(cpm):
-                    raise ValueError(f"Expected {len(cpm)} elements for parameter '{name}', got {len(input_val)}")
+                if len(input_val) != len(spm):
+                    raise ValueError(f"Expected {len(spm)} elements for parameter '{name}', got {len(input_val)}")
                 sharded_input_val = []
                 for i, x in enumerate(input_val):
-                    if torch.is_tensor(x) and not cpm[i].split_output:
-                        x = self._prepare_cp_input(x, cpm[i], args_list, kwargs)
+                    if torch.is_tensor(x) and not spm[i].split_output:
+                        x = self._prepare_sp_input(x, spm[i], args_list, kwargs)
                     sharded_input_val.append(x)
                 input_val = type(input_val)(sharded_input_val)
             else:
@@ -239,26 +244,26 @@ class ContextParallelSplitHook(ModelHook):
 
         output_list = [output] if is_tensor else list(output)
 
-        for index, cpm in self.metadata.items():
+        for index, spm in self.metadata.items():
             if not isinstance(index, int):
                 continue
-            if not isinstance(cpm, (ContextParallelInput, ContextParallelPartialInput)) or not cpm.split_output:
+            if not isinstance(spm, (SequenceParallelInput, SequenceParallelPartialInput)) or not spm.split_output:
                 continue
             if index >= len(output_list):
                 raise ValueError(f"Index {index} out of bounds for output of length {len(output_list)}.")
 
-            output_list[index] = self._prepare_cp_input(output_list[index], cpm, self._last_args, self._last_kwargs)
+            output_list[index] = self._prepare_sp_input(output_list[index], spm, self._last_args, self._last_kwargs)
 
         return output_list[0] if is_tensor else type(output)(output_list)
 
     def _resolve_text_len(
         self,
-        cp_input: ContextParallelPartialInput,
+        sp_input: SequenceParallelPartialInput,
         args: tuple,
         kwargs: dict,
     ) -> int:
         """Resolve text length from the source specification."""
-        source = cp_input.text_len_source
+        source = sp_input.text_len_source
 
         if isinstance(source, int):
             return source
@@ -283,56 +288,58 @@ class ContextParallelSplitHook(ModelHook):
         except ValueError as e:
             raise ValueError(f"Failed to resolve text_len_source '{source}': {e}") from e
 
-    def _prepare_cp_input(
+    def _prepare_sp_input(
         self,
         x: torch.Tensor,
-        cp_input: AnyContextParallelInput,
+        sp_input: AnySequenceParallelInput,
         args: tuple = (),
         kwargs: dict | None = None,
     ) -> torch.Tensor:
         """Shard a tensor according to the input specification."""
         kwargs = kwargs or {}
 
-        if cp_input.expected_dims is not None and x.dim() != cp_input.expected_dims:
-            logger.warning_once(f"Expected tensor with {cp_input.expected_dims} dims, got {x.dim()}. Skipping split.")
+        if sp_input.expected_dims is not None and x.dim() != sp_input.expected_dims:
+            logger.warning_once(f"Expected tensor with {sp_input.expected_dims} dims, got {x.dim()}. Skipping split.")
             return x
 
-        if isinstance(cp_input, ContextParallelInput):
+        if isinstance(sp_input, SequenceParallelInput):
             # Full split
-            return cp_shard(x, cp_input.split_dim, validate=False)
-        elif isinstance(cp_input, ContextParallelPartialInput):
+            return sp_shard(x, sp_input.split_dim, validate=False)
+        elif isinstance(sp_input, SequenceParallelPartialInput):
             # Partial split: keep text portion, split image portion
-            text_len = self._resolve_text_len(cp_input, args, kwargs)
-            dim = cp_input.split_dim
+            text_len = self._resolve_text_len(sp_input, args, kwargs)
+            dim = sp_input.split_dim
 
             # Split tensor into text and image portions
             text_part = x.narrow(dim, 0, text_len)
             image_part = x.narrow(dim, text_len, x.size(dim) - text_len)
 
             # Only shard the image portion
-            image_part_sharded = cp_shard(image_part, dim, validate=False)
+            image_part_sharded = sp_shard(image_part, dim, validate=False)
 
             # Concatenate back: [text_full, image_sharded]
             return torch.cat([text_part, image_part_sharded], dim=dim)
         else:
-            raise ValueError(f"Unsupported input config type: {type(cp_input).__name__}")
+            raise ValueError(f"Unsupported input config type: {type(sp_input).__name__}")
 
 
-class ContextParallelGatherHook(ModelHook):
+class SequenceParallelGatherHook(ModelHook):
     """Hook for gathering outputs after a module's forward pass.
 
     This hook is registered to modules that need their outputs gathered
-    from all context parallel ranks. It intercepts the output and gathers
+    from all sequence parallel ranks. It intercepts the output and gathers
     it according to the plan specification.
+
+    Note: This corresponds to `ContextParallelGatherHook` in diffusers.
     """
 
     def __init__(
         self,
-        metadata: ContextParallelOutput | list[ContextParallelOutput],
-        config: ContextParallelConfig,
+        metadata: SequenceParallelOutput | list[SequenceParallelOutput],
+        config: SequenceParallelConfig,
     ) -> None:
         super().__init__()
-        if isinstance(metadata, ContextParallelOutput):
+        if isinstance(metadata, SequenceParallelOutput):
             metadata = [metadata]
         self.metadata = metadata
         self.config = config
@@ -354,18 +361,18 @@ class ContextParallelGatherHook(ModelHook):
         if len(output) != len(self.metadata):
             raise ValueError(f"Expected {len(self.metadata)} outputs, got {len(output)}.")
 
-        for i, cpm in enumerate(self.metadata):
-            if cpm is None:
+        for i, spm in enumerate(self.metadata):
+            if spm is None:
                 continue
 
             x = output[i]
-            if cpm.expected_dims is not None and x.dim() != cpm.expected_dims:
+            if spm.expected_dims is not None and x.dim() != spm.expected_dims:
                 logger.warning_once(
-                    f"Expected output tensor with {cpm.expected_dims} dims, got {x.dim()}. Skipping gather."
+                    f"Expected output tensor with {spm.expected_dims} dims, got {x.dim()}. Skipping gather."
                 )
                 continue
 
-            output[i] = cp_gather(x, cpm.gather_dim, validate=False)
+            output[i] = sp_gather(x, spm.gather_dim, validate=False)
 
         return output[0] if is_tensor else type(output)(output)
 
@@ -414,36 +421,38 @@ def _find_submodule_by_name(model: nn.Module, name: str) -> nn.Module | list[nn.
             raise ValueError(f"'{first_atom}' is not a submodule of '{model.__class__.__name__}'")
 
 
-def apply_context_parallel(
+def apply_sequence_parallel(
     module: nn.Module,
-    config: ContextParallelConfig,
-    plan: ContextParallelModelPlan,
+    config: SequenceParallelConfig,
+    plan: SequenceParallelModelPlan,
 ) -> None:
-    """Apply context parallel hooks to a model according to the plan.
+    """Apply sequence parallel hooks to a model according to the plan.
 
     This function registers hooks on the specified submodules to automatically
-    shard inputs and gather outputs for context parallelism.
+    shard inputs and gather outputs for sequence parallelism.
 
-    The complete CP flow is:
-    1. Input sharding (ContextParallelSplitHook): Split sequence across SP ranks
+    Note: This corresponds to `apply_context_parallel` in diffusers.
+
+    The complete SP flow is:
+    1. Input sharding (SequenceParallelSplitHook): Split sequence across SP ranks
     2. Attention parallelism (handled by vLLM-Omni's Attention layer):
        - Ulysses: All-to-All over Q/K/V heads
        - Ring: K/V circulation in ring topology
-       - Hybrid: Both (Ulysses handles heads, Ring handles K/V)
-    3. Output gathering (ContextParallelGatherHook): Gather sequence from SP ranks
+       - Hybrid: Both (Ulysses handles head redistribution, Ring handles K/V)
+    3. Output gathering (SequenceParallelGatherHook): Gather sequence from SP ranks
 
     Args:
-        module: The model to apply CP to.
-        config: The context parallel configuration.
+        module: The model to apply SP to.
+        config: The sequence parallel configuration.
         plan: Dictionary mapping module names to input/output specifications.
 
     Example:
-        config = ContextParallelConfig(ulysses_degree=2)
+        config = SequenceParallelConfig(ulysses_degree=2)
         plan = {
-            "": {"hidden_states": ContextParallelInput(split_dim=1, expected_dims=3)},
-            "proj_out": ContextParallelOutput(gather_dim=1, expected_dims=3),
+            "": {"hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3)},
+            "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
         }
-        apply_context_parallel(model, config, plan)
+        apply_sequence_parallel(model, config, plan)
 
     Note:
         vLLM-Omni's Attention layer automatically handles the internal
@@ -452,48 +461,50 @@ def apply_context_parallel(
         sharding for the model as a whole.
     """
     logger.debug(
-        f"Applying context parallel with config: ulysses={config.ulysses_degree}, "
+        f"Applying sequence parallel with config: ulysses={config.ulysses_degree}, "
         f"ring={config.ring_degree}, plan keys: {list(plan.keys())}"
     )
 
-    for module_id, cp_model_plan in plan.items():
+    for module_id, sp_model_plan in plan.items():
         submodule = _get_submodule_by_name(module, module_id)
         if not isinstance(submodule, list):
             submodule = [submodule]
 
-        logger.debug(f"Applying CP hooks to '{module_id}' ({len(submodule)} module(s))")
+        logger.debug(f"Applying SP hooks to '{module_id}' ({len(submodule)} module(s))")
 
         for m in submodule:
-            if isinstance(cp_model_plan, dict):
+            if isinstance(sp_model_plan, dict):
                 # Input specification
-                hook = ContextParallelSplitHook(cp_model_plan, config)
-                hook_name = _CP_INPUT_HOOK_TEMPLATE.format(module_id)
-            elif isinstance(cp_model_plan, (ContextParallelOutput, list, tuple)):
+                hook = SequenceParallelSplitHook(sp_model_plan, config)
+                hook_name = _SP_INPUT_HOOK_TEMPLATE.format(module_id)
+            elif isinstance(sp_model_plan, (SequenceParallelOutput, list, tuple)):
                 # Output specification
-                if isinstance(cp_model_plan, ContextParallelOutput):
-                    cp_model_plan = [cp_model_plan]
-                if not all(isinstance(x, ContextParallelOutput) or x is None for x in cp_model_plan):
-                    raise ValueError(f"Expected ContextParallelOutput elements, got {cp_model_plan}")
-                hook = ContextParallelGatherHook(cp_model_plan, config)
-                hook_name = _CP_OUTPUT_HOOK_TEMPLATE.format(module_id)
+                if isinstance(sp_model_plan, SequenceParallelOutput):
+                    sp_model_plan = [sp_model_plan]
+                if not all(isinstance(x, SequenceParallelOutput) or x is None for x in sp_model_plan):
+                    raise ValueError(f"Expected SequenceParallelOutput elements, got {sp_model_plan}")
+                hook = SequenceParallelGatherHook(sp_model_plan, config)
+                hook_name = _SP_OUTPUT_HOOK_TEMPLATE.format(module_id)
             else:
-                raise ValueError(f"Unsupported plan type: {type(cp_model_plan).__name__}")
+                raise ValueError(f"Unsupported plan type: {type(sp_model_plan).__name__}")
 
             registry = HookRegistry.get_or_create(m)
             registry.register_hook(hook_name, hook)
 
 
-def remove_context_parallel(
+def remove_sequence_parallel(
     module: nn.Module,
-    plan: ContextParallelModelPlan,
+    plan: SequenceParallelModelPlan,
 ) -> None:
-    """Remove context parallel hooks from a model.
+    """Remove sequence parallel hooks from a model.
+
+    Note: This corresponds to `remove_context_parallel` in diffusers.
 
     Args:
-        module: The model to remove CP from.
-        plan: The same plan used when applying CP.
+        module: The model to remove SP from.
+        plan: The same plan used when applying SP.
     """
-    for module_id, cp_model_plan in plan.items():
+    for module_id, sp_model_plan in plan.items():
         submodule = _get_submodule_by_name(module, module_id)
         if not isinstance(submodule, list):
             submodule = [submodule]
@@ -503,37 +514,40 @@ def remove_context_parallel(
             if registry is None:
                 continue
 
-            if isinstance(cp_model_plan, dict):
-                hook_name = _CP_INPUT_HOOK_TEMPLATE.format(module_id)
-            elif isinstance(cp_model_plan, (ContextParallelOutput, list, tuple)):
-                hook_name = _CP_OUTPUT_HOOK_TEMPLATE.format(module_id)
+            if isinstance(sp_model_plan, dict):
+                hook_name = _SP_INPUT_HOOK_TEMPLATE.format(module_id)
+            elif isinstance(sp_model_plan, (SequenceParallelOutput, list, tuple)):
+                hook_name = _SP_OUTPUT_HOOK_TEMPLATE.format(module_id)
             else:
                 continue
 
             registry.remove_hook(hook_name)
 
 
-def enable_context_parallel_for_model(
+def enable_sequence_parallel_for_model(
     model: nn.Module,
-    config: ContextParallelConfig | None = None,
+    config: SequenceParallelConfig | None = None,
 ) -> None:
-    """Enable context parallelism for a model using its _cp_plan.
+    """Enable sequence parallelism for a model using its _sp_plan.
 
-    This is a convenience function that reads the model's _cp_plan attribute
-    and applies context parallelism automatically.
+    This is a convenience function that reads the model's _sp_plan attribute
+    and applies sequence parallelism automatically.
+
+    Note: This corresponds to `enable_context_parallel_for_model` in diffusers,
+    but uses vLLM-Omni's _sp_plan instead of diffusers' _cp_plan.
 
     The function performs two main tasks:
-    1. Applies _cp_plan hooks to shard inputs and gather outputs
+    1. Applies _sp_plan hooks to shard inputs and gather outputs
     2. Ensures Attention layers are configured for the correct parallel mode
        (handled automatically by vLLM-Omni's forward_context mechanism)
 
     Args:
-        model: The model to enable CP for. Must have a _cp_plan attribute.
+        model: The model to enable SP for. Must have a _sp_plan attribute.
         config: Optional config. If None, uses default based on current
             parallel state.
 
     Raises:
-        ValueError: If model has no _cp_plan defined.
+        ValueError: If model has no _sp_plan defined.
 
     Note:
         vLLM-Omni supports Ulysses + Ring hybrid parallelism:
@@ -542,24 +556,24 @@ def enable_context_parallel_for_model(
         - Both > 1: Hybrid mode (Ulysses handles head redistribution,
           Ring handles K/V circulation)
     """
-    from vllm_omni.diffusion.distributed.cp_plan import get_cp_plan_from_model
     from vllm_omni.diffusion.distributed.parallel_state import (
         get_ring_parallel_world_size,
         get_ulysses_parallel_world_size,
     )
+    from vllm_omni.diffusion.distributed.sp_plan import get_sp_plan_from_model
 
-    plan = get_cp_plan_from_model(model)
+    plan = get_sp_plan_from_model(model)
     if plan is None:
         raise ValueError(
-            f"Model {model.__class__.__name__} has no _cp_plan defined. "
-            f"Define _cp_plan as a class attribute or pass a plan explicitly."
+            f"Model {model.__class__.__name__} has no _sp_plan defined. "
+            f"Define _sp_plan as a class attribute or pass a plan explicitly."
         )
 
     if config is None:
         # Create config from current parallel state
         ulysses_degree = get_ulysses_parallel_world_size()
         ring_degree = get_ring_parallel_world_size()
-        config = ContextParallelConfig(
+        config = SequenceParallelConfig(
             ulysses_degree=ulysses_degree,
             ring_degree=ring_degree,
         )
@@ -570,23 +584,25 @@ def enable_context_parallel_for_model(
         else:
             mode = "ring"
         logger.info(
-            f"Created CP config from parallel state: "
+            f"Created SP config from parallel state: "
             f"ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, "
             f"mode={mode}"
         )
 
-    apply_context_parallel(model, config, plan)
-    logger.info(f"Enabled context parallelism for {model.__class__.__name__}")
+    apply_sequence_parallel(model, config, plan)
+    logger.info(f"Enabled sequence parallelism for {model.__class__.__name__}")
 
 
-def disable_context_parallel_for_model(model: nn.Module) -> None:
-    """Disable context parallelism for a model.
+def disable_sequence_parallel_for_model(model: nn.Module) -> None:
+    """Disable sequence parallelism for a model.
+
+    Note: This corresponds to `disable_context_parallel_for_model` in diffusers.
 
     Args:
-        model: The model to disable CP for.
+        model: The model to disable SP for.
     """
-    from vllm_omni.diffusion.distributed.cp_plan import get_cp_plan_from_model
+    from vllm_omni.diffusion.distributed.sp_plan import get_sp_plan_from_model
 
-    plan = get_cp_plan_from_model(model)
+    plan = get_sp_plan_from_model(model)
     if plan is not None:
-        remove_context_parallel(model, plan)
+        remove_sequence_parallel(model, plan)

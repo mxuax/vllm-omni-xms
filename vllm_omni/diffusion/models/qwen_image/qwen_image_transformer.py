@@ -25,9 +25,9 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.cp_plan import (
-    ContextParallelInput,
-    ContextParallelOutput,
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,
+    SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
@@ -41,10 +41,12 @@ class ImageRopePrepare(nn.Module):
 
     This module encapsulates the input linear projection and RoPE computation.
     Similar to Z-Image's UnifiedPrepare, this creates a module boundary where
-    _cp_plan can shard outputs via split_output=True.
+    _sp_plan can shard outputs via split_output=True.
 
     The key insight is that hidden_states and vid_freqs must be sharded together
     to maintain dimension alignment for RoPE computation in attention layers.
+
+    Note: Our _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism).
     """
 
     def __init__(self, img_in: nn.Linear, pos_embed: nn.Module):
@@ -70,7 +72,7 @@ class ImageRopePrepare(nn.Module):
             vid_freqs: Image RoPE frequencies [img_seq_len, rope_dim]
             txt_freqs: Text RoPE frequencies [txt_seq_len, rope_dim]
 
-        Note: _cp_plan will shard hidden_states and vid_freqs via split_output=True
+        Note: _sp_plan will shard hidden_states and vid_freqs via split_output=True
               txt_freqs is kept replicated for dual-stream attention
         """
         # Apply input projection
@@ -726,21 +728,23 @@ class QwenImageTransformer2DModel(CachedTransformer):
     # used for torch compile optimizations
     _repeated_blocks = ["QwenImageTransformerBlock"]
 
-    # Context Parallelism plan (following diffusers pattern)
+    # Sequence Parallelism plan (following diffusers' _cp_plan pattern)
     # Similar to Z-Image's UnifiedPrepare, we use ImageRopePrepare to create
-    # a module boundary where _cp_plan can shard hidden_states and vid_freqs together.
+    # a module boundary where _sp_plan can shard hidden_states and vid_freqs together.
     #
     # Key insight: hidden_states and vid_freqs MUST be sharded together to maintain
     # dimension alignment for RoPE computation in attention layers.
-    _cp_plan = {
+    #
+    # Note: _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism)
+    _sp_plan = {
         # Shard ImageRopePrepare outputs (hidden_states and vid_freqs must be sharded together)
         "image_rope_prepare": {
-            0: ContextParallelInput(split_dim=1, expected_dims=3, split_output=True),  # hidden_states
-            1: ContextParallelInput(split_dim=0, expected_dims=2, split_output=True),  # vid_freqs
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),  # hidden_states
+            1: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True),  # vid_freqs
             # txt_freqs (index 2) is NOT sharded - kept replicated for dual-stream attention
         },
         # Gather output at proj_out
-        "proj_out": ContextParallelOutput(gather_dim=1, expected_dims=3),
+        "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
 
     def __init__(
@@ -800,7 +804,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
         self.gradient_checkpointing = False
         self.zero_cond_t = zero_cond_t
 
-        # ImageRopePrepare module for _cp_plan to shard hidden_states and vid_freqs together
+        # ImageRopePrepare module for _sp_plan to shard hidden_states and vid_freqs together
         # This ensures RoPE dimensions align with hidden_states after sharding
         self.image_rope_prepare = ImageRopePrepare(self.img_in, self.pos_embed)
 
@@ -848,7 +852,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
         #     lora_scale = 1.0
 
         # Prepare hidden_states and RoPE via ImageRopePrepare module
-        # _cp_plan will shard hidden_states and vid_freqs together via split_output=True
+        # _sp_plan will shard hidden_states and vid_freqs together via split_output=True
         # txt_freqs is kept replicated for dual-stream attention
         hidden_states, vid_freqs, txt_freqs = self.image_rope_prepare(hidden_states, img_shapes, txt_seq_lens)
         image_rotary_emb = (vid_freqs, txt_freqs)

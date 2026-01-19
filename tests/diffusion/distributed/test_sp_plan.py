@@ -1,50 +1,53 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Simple tests for the CP plan framework.
+"""Simple tests for the SP plan framework.
 
-These tests verify the CP plan mechanism works correctly without requiring
+These tests verify the SP plan mechanism works correctly without requiring
 a distributed environment. They test:
-1. _cp_plan validation
+1. _sp_plan validation
 2. Hook registration and tensor sharding (mocked)
-3. Model _cp_plan definitions
+3. Model _sp_plan definitions
+
+Note: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
+We use the term "Sequence Parallelism" to align with vLLM-Omni's existing terminology.
 """
 
 import pytest
 import torch
 import torch.nn as nn
 
-from vllm_omni.diffusion.distributed.cp_plan import (
-    ContextParallelInput,
-    ContextParallelOutput,
-    ContextParallelPartialInput,
-    get_cp_plan_from_model,
-    validate_cp_plan,
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,
+    SequenceParallelOutput,
+    SequenceParallelPartialInput,
+    get_sp_plan_from_model,
+    validate_sp_plan,
 )
 
 
-class TestContextParallelPlanValidation:
-    """Test _cp_plan validation logic."""
+class TestSequenceParallelPlanValidation:
+    """Test _sp_plan validation logic."""
 
     def test_valid_simple_plan(self):
-        """Test a simple valid _cp_plan."""
+        """Test a simple valid _sp_plan."""
         plan = {
             "rope": {
-                0: ContextParallelInput(split_dim=1, expected_dims=4, split_output=True),
-                1: ContextParallelInput(split_dim=1, expected_dims=4, split_output=True),
+                0: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),
+                1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),
             },
             "blocks.0": {
-                "hidden_states": ContextParallelInput(split_dim=1, expected_dims=3),
+                "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3),
             },
-            "proj_out": ContextParallelOutput(gather_dim=1, expected_dims=3),
+            "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
         }
         # Should not raise
-        validate_cp_plan(plan)
+        validate_sp_plan(plan)
 
     def test_valid_partial_input_plan(self):
-        """Test a valid _cp_plan with ContextParallelPartialInput."""
+        """Test a valid _sp_plan with SequenceParallelPartialInput."""
         plan = {
             "pos_embed": {
-                0: ContextParallelPartialInput(
+                0: SequenceParallelPartialInput(
                     split_dim=0,
                     text_len_source="txt_ids",
                     expected_dims=2,
@@ -52,117 +55,119 @@ class TestContextParallelPlanValidation:
                 ),
             },
             "blocks.0": {
-                "hidden_states": ContextParallelInput(split_dim=1, expected_dims=3),
+                "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3),
             },
         }
         # Should not raise
-        validate_cp_plan(plan)
+        validate_sp_plan(plan)
 
     def test_invalid_plan_type(self):
         """Test that non-dict plan raises error."""
         with pytest.raises(ValueError, match="must be a dict"):
-            validate_cp_plan("not a dict")
+            validate_sp_plan("not a dict")
 
     def test_invalid_module_key_type(self):
         """Test that non-string module keys raise error."""
-        plan = {123: {"hidden_states": ContextParallelInput(split_dim=1)}}
+        plan = {123: {"hidden_states": SequenceParallelInput(split_dim=1)}}
         with pytest.raises(ValueError, match="keys must be strings"):
-            validate_cp_plan(plan)
+            validate_sp_plan(plan)
 
     def test_invalid_output_index_without_split_output(self):
         """Test that integer keys require split_output=True."""
         plan = {
             "rope": {
-                0: ContextParallelInput(split_dim=1, split_output=False),  # Invalid
+                0: SequenceParallelInput(split_dim=1, split_output=False),  # Invalid
             }
         }
         with pytest.raises(ValueError, match="split_output=True"):
-            validate_cp_plan(plan)
+            validate_sp_plan(plan)
 
 
-class TestGetCpPlanFromModel:
-    """Test get_cp_plan_from_model utility."""
+class TestGetSpPlanFromModel:
+    """Test get_sp_plan_from_model utility."""
 
-    def test_model_with_cp_plan(self):
-        """Test getting _cp_plan from a model that has one."""
+    def test_model_with_sp_plan(self):
+        """Test getting _sp_plan from a model that has one."""
 
         class ModelWithPlan(nn.Module):
-            _cp_plan = {
+            _sp_plan = {
                 "layer": {
-                    "x": ContextParallelInput(split_dim=1),
+                    "x": SequenceParallelInput(split_dim=1),
                 }
             }
 
         model = ModelWithPlan()
-        plan = get_cp_plan_from_model(model)
+        plan = get_sp_plan_from_model(model)
         assert plan is not None
         assert "layer" in plan
 
-    def test_model_without_cp_plan(self):
-        """Test getting _cp_plan from a model without one."""
+    def test_model_without_sp_plan(self):
+        """Test getting _sp_plan from a model without one."""
 
         class ModelWithoutPlan(nn.Module):
             pass
 
         model = ModelWithoutPlan()
-        plan = get_cp_plan_from_model(model)
+        plan = get_sp_plan_from_model(model)
         assert plan is None
 
 
-class TestContextParallelInputTypes:
-    """Test ContextParallelInput and related types."""
+class TestSequenceParallelInputTypes:
+    """Test SequenceParallelInput and related types."""
 
-    def test_context_parallel_input_repr(self):
-        """Test ContextParallelInput repr."""
-        cpi = ContextParallelInput(split_dim=1, expected_dims=3, split_output=True)
-        assert "split_dim=1" in repr(cpi)
-        assert "expected_dims=3" in repr(cpi)
-        assert "split_output=True" in repr(cpi)
+    def test_sequence_parallel_input_repr(self):
+        """Test SequenceParallelInput repr."""
+        spi = SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True)
+        assert "split_dim=1" in repr(spi)
+        assert "expected_dims=3" in repr(spi)
+        assert "split_output=True" in repr(spi)
 
-    def test_context_parallel_output_repr(self):
-        """Test ContextParallelOutput repr."""
-        cpo = ContextParallelOutput(gather_dim=1, expected_dims=3)
-        assert "gather_dim=1" in repr(cpo)
-        assert "expected_dims=3" in repr(cpo)
+    def test_sequence_parallel_output_repr(self):
+        """Test SequenceParallelOutput repr."""
+        spo = SequenceParallelOutput(gather_dim=1, expected_dims=3)
+        assert "gather_dim=1" in repr(spo)
+        assert "expected_dims=3" in repr(spo)
 
-    def test_context_parallel_partial_input_repr(self):
-        """Test ContextParallelPartialInput repr."""
-        cppi = ContextParallelPartialInput(
+    def test_sequence_parallel_partial_input_repr(self):
+        """Test SequenceParallelPartialInput repr."""
+        sppi = SequenceParallelPartialInput(
             split_dim=0,
             text_len_source="txt_ids",
             expected_dims=2,
             split_output=True,
         )
-        assert "split_dim=0" in repr(cppi)
-        assert "txt_ids" in repr(cppi)
-        assert "expected_dims=2" in repr(cppi)
-        assert "split_output=True" in repr(cppi)
+        assert "split_dim=0" in repr(sppi)
+        assert "txt_ids" in repr(sppi)
+        assert "expected_dims=2" in repr(sppi)
+        assert "split_output=True" in repr(sppi)
 
-    def test_context_parallel_partial_input_with_int_source(self):
-        """Test ContextParallelPartialInput with integer text_len_source."""
-        cppi = ContextParallelPartialInput(
+    def test_sequence_parallel_partial_input_with_int_source(self):
+        """Test SequenceParallelPartialInput with integer text_len_source."""
+        sppi = SequenceParallelPartialInput(
             split_dim=0,
             text_len_source=512,  # Fixed length
             expected_dims=2,
         )
-        assert cppi.text_len_source == 512
+        assert sppi.text_len_source == 512
 
 
-class TestModelCpPlans:
-    """Test that model _cp_plan definitions are valid."""
+class TestModelSpPlans:
+    """Test that model _sp_plan definitions are valid."""
 
-    def test_zimage_transformer_cp_plan(self):
-        """Test ZImageTransformer2DModel _cp_plan structure.
+    def test_zimage_transformer_sp_plan(self):
+        """Test ZImageTransformer2DModel _sp_plan structure.
 
         The plan specifies:
         - unified_prepare: Shard all 4 outputs (unified, cos, sin, attn_mask)
         - all_final_layer.2-1: Gather outputs after final layer
+
+        Note: _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism)
         """
         try:
             from vllm_omni.diffusion.models.z_image.z_image_transformer import ZImageTransformer2DModel
 
-            plan = getattr(ZImageTransformer2DModel, "_cp_plan", None)
-            assert plan is not None, "ZImageTransformer2DModel should define _cp_plan"
+            plan = getattr(ZImageTransformer2DModel, "_sp_plan", None)
+            assert plan is not None, "ZImageTransformer2DModel should define _sp_plan"
             assert isinstance(plan, dict)
 
             assert "unified_prepare" in plan
@@ -178,8 +183,8 @@ class TestModelCpPlans:
         except ImportError:
             pytest.skip("ZImageTransformer2DModel not available")
 
-    def test_qwen_image_transformer_cp_plan(self):
-        """Test QwenImageTransformer2DModel _cp_plan structure.
+    def test_qwen_image_transformer_sp_plan(self):
+        """Test QwenImageTransformer2DModel _sp_plan structure.
 
         Qwen-Image follows the diffusers pattern similar to Z-Image:
         - image_rope_prepare: Shards hidden_states and vid_freqs together
@@ -187,14 +192,16 @@ class TestModelCpPlans:
 
         Key insight: hidden_states and vid_freqs MUST be sharded together
         to maintain dimension alignment for RoPE computation.
+
+        Note: _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism)
         """
         try:
             from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
                 QwenImageTransformer2DModel,
             )
 
-            plan = getattr(QwenImageTransformer2DModel, "_cp_plan", None)
-            assert plan is not None, "QwenImageTransformer2DModel should define _cp_plan"
+            plan = getattr(QwenImageTransformer2DModel, "_sp_plan", None)
+            assert plan is not None, "QwenImageTransformer2DModel should define _sp_plan"
             assert isinstance(plan, dict)
 
             # Check image_rope_prepare sharding
@@ -216,7 +223,7 @@ class TestModelCpPlans:
             proj_out_plan = plan["proj_out"]
             assert proj_out_plan.gather_dim == 1
 
-            validate_cp_plan(plan)
+            validate_sp_plan(plan)
         except ImportError:
             pytest.skip("QwenImageTransformer2DModel not available")
 
@@ -234,7 +241,7 @@ class TestMockSharding:
         world_size = 4
         rank = 1
 
-        # Manual chunking (what cp_shard does internally)
+        # Manual chunking (what sp_shard does internally)
         chunks = tensor.chunk(world_size, dim=1)
         sharded = chunks[rank]
 

@@ -8,13 +8,13 @@ from vllm_omni.diffusion.hooks.base import (
     ModelHook,
     StateManager,
 )
-from vllm_omni.diffusion.hooks.context_parallel import (
-    ContextParallelGatherHook,
-    ContextParallelSplitHook,
-    apply_context_parallel,
-    disable_context_parallel_for_model,
-    enable_context_parallel_for_model,
-    remove_context_parallel,
+from vllm_omni.diffusion.hooks.sequence_parallel import (
+    SequenceParallelGatherHook,
+    SequenceParallelSplitHook,
+    apply_sequence_parallel,
+    disable_sequence_parallel_for_model,
+    enable_sequence_parallel_for_model,
+    remove_sequence_parallel,
 )
 
 __all__ = [
@@ -23,11 +23,11 @@ __all__ = [
     "StateManager",
     "ModelHook",
     "HookRegistry",
-    # Context parallel hooks
-    "ContextParallelSplitHook",
-    "ContextParallelGatherHook",
-    "apply_context_parallel",
-    "remove_context_parallel",
-    "enable_context_parallel_for_model",
-    "disable_context_parallel_for_model",
+    # Sequence parallel hooks (corresponds to diffusers' context_parallel)
+    "SequenceParallelSplitHook",
+    "SequenceParallelGatherHook",
+    "apply_sequence_parallel",
+    "remove_sequence_parallel",
+    "enable_sequence_parallel_for_model",
+    "disable_sequence_parallel_for_model",
 ]

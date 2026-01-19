@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project and The HuggingFace Team
-"""Context Parallelism configuration for vLLM-Omni.
+"""Sequence Parallelism configuration for vLLM-Omni.
 
-This module provides configuration classes for Context Parallelism (CP),
+This module provides configuration classes for Sequence Parallelism (SP),
 adapting the diffusers-style _cp_plan mechanism to use vLLM-Omni's existing
 parallel state management (SequenceParallelGroupCoordinator).
+
+NOTE: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
+We use the term "Sequence Parallelism" to align with vLLM-Omni's existing terminology.
 """
 
 from __future__ import annotations
@@ -17,12 +20,13 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class ContextParallelConfig:
-    """Configuration for Context Parallelism using vLLM-Omni's parallel state.
+class SequenceParallelConfig:
+    """Configuration for Sequence Parallelism using vLLM-Omni's parallel state.
 
-    This class provides a unified interface for CP configuration that integrates
+    This class provides a unified interface for SP configuration that integrates
     with vLLM-Omni's existing SequenceParallelGroupCoordinator. Unlike diffusers'
-    DeviceMesh-based approach, this uses the existing parallel state management.
+    DeviceMesh-based approach (ContextParallelConfig), this uses the existing
+    parallel state management.
 
     Args:
         ulysses_degree: Number of devices for Ulysses (All-to-All) attention.
@@ -55,7 +59,7 @@ class ContextParallelConfig:
 
         if self.ulysses_degree == 1 and self.ring_degree == 1:
             raise ValueError(
-                "At least one of `ulysses_degree` or `ring_degree` must be > 1 to use context parallelism."
+                "At least one of `ulysses_degree` or `ring_degree` must be > 1 to use sequence parallelism."
             )
 
     @property
@@ -132,7 +136,7 @@ class ContextParallelConfig:
     def setup(self, rank: int, world_size: int, device: torch.device) -> None:
         """Initialize the config with runtime parallel state.
 
-        This is called automatically when context parallelism is enabled.
+        This is called automatically when sequence parallelism is enabled.
 
         Args:
             rank: The global rank of this process.

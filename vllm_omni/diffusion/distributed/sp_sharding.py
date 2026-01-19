@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project and The HuggingFace Team
-"""Context Parallelism sharding utilities.
+"""Sequence Parallelism sharding utilities.
 
 This module provides low-level sharding and gathering functions for
-Context Parallelism. These can be used directly in model forward methods
-for semi-intrusive CP support, or internally by the CP hooks.
+Sequence Parallelism. These can be used directly in model forward methods
+for semi-intrusive SP support, or internally by the SP hooks.
+
+NOTE: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
+We use the term "Sequence Parallelism" to align with vLLM-Omni's existing terminology.
 
 The functions use vLLM-Omni's existing SequenceParallelGroupCoordinator
 for communication instead of PyTorch's DeviceMesh.
@@ -28,12 +31,12 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 logger = init_logger(__name__)
 
 
-def cp_shard(
+def sp_shard(
     tensor: torch.Tensor,
     dim: int,
     validate: bool = True,
 ) -> torch.Tensor:
-    """Shard a tensor along the specified dimension for context parallelism.
+    """Shard a tensor along the specified dimension for sequence parallelism.
 
     The tensor is split into world_size chunks along dim, and this rank
     receives its corresponding chunk.
@@ -51,7 +54,7 @@ def cp_shard(
 
     Example:
         # In model forward:
-        hidden_states = cp_shard(hidden_states, dim=1)
+        hidden_states = sp_shard(hidden_states, dim=1)
     """
     world_size = get_sequence_parallel_world_size()
 
@@ -64,18 +67,18 @@ def cp_shard(
     if validate and size % world_size != 0:
         raise ValueError(
             f"Tensor size along dim {dim} ({size}) must be divisible by "
-            f"world_size ({world_size}) for context parallel sharding."
+            f"world_size ({world_size}) for sequence parallel sharding."
         )
 
     return tensor.chunk(world_size, dim=dim)[rank]
 
 
-def cp_gather(
+def sp_gather(
     tensor: torch.Tensor,
     dim: int,
     validate: bool = True,
 ) -> torch.Tensor:
-    """Gather a tensor along the specified dimension from all context parallel ranks.
+    """Gather a tensor along the specified dimension from all sequence parallel ranks.
 
     The sharded tensors from all ranks are concatenated along dim.
 
@@ -89,7 +92,7 @@ def cp_gather(
 
     Example:
         # At end of model forward:
-        output = cp_gather(output, dim=1)
+        output = sp_gather(output, dim=1)
     """
     world_size = get_sequence_parallel_world_size()
 
@@ -100,7 +103,7 @@ def cp_gather(
     return sp_group.all_gather(tensor, dim=dim)
 
 
-def cp_shard_with_padding(
+def sp_shard_with_padding(
     tensor: torch.Tensor,
     dim: int,
     pad_value: float = 0.0,
@@ -119,9 +122,9 @@ def cp_shard_with_padding(
         how much padding was added to the original tensor before sharding.
 
     Example:
-        sharded, pad_size = cp_shard_with_padding(hidden_states, dim=1)
+        sharded, pad_size = sp_shard_with_padding(hidden_states, dim=1)
         # ... process ...
-        output = cp_gather(output, dim=1)
+        output = sp_gather(output, dim=1)
         if pad_size > 0:
             output = output[..., :-pad_size]  # Remove padding
     """
@@ -134,7 +137,7 @@ def cp_shard_with_padding(
     remainder = size % world_size
 
     if remainder == 0:
-        return cp_shard(tensor, dim, validate=False), 0
+        return sp_shard(tensor, dim, validate=False), 0
 
     # Pad to make divisible
     pad_size = world_size - remainder
@@ -143,7 +146,7 @@ def cp_shard_with_padding(
     padding = torch.full(pad_shape, pad_value, dtype=tensor.dtype, device=tensor.device)
     tensor = torch.cat([tensor, padding], dim=dim)
 
-    return cp_shard(tensor, dim, validate=False), pad_size
+    return sp_shard(tensor, dim, validate=False), pad_size
 
 
 @dataclass
@@ -210,7 +213,7 @@ class ShardingValidator:
                 logger.warning(f"Tensor '{name}' sharded multiple times")
             self._sharded.add(name)
 
-        return cp_shard(tensor, dim, validate=validate_divisible)
+        return sp_shard(tensor, dim, validate=validate_divisible)
 
     def gather(
         self,
@@ -233,7 +236,7 @@ class ShardingValidator:
                 logger.warning(f"Tensor '{name}' gathered without being sharded")
             self._gathered.add(name)
 
-        return cp_gather(tensor, dim)
+        return sp_gather(tensor, dim)
 
     def validate(self) -> None:
         """Validate that all sharded tensors were gathered.
@@ -245,7 +248,7 @@ class ShardingValidator:
         if unmatched:
             raise ValueError(
                 f"The following tensors were sharded but not gathered: {unmatched}. "
-                f"This may indicate a bug in the model's CP implementation."
+                f"This may indicate a bug in the model's SP implementation."
             )
 
 
@@ -279,7 +282,7 @@ class AllGatherFunction(torch.autograd.Function):
         ctx.dim = dim
         ctx.world_size = get_sequence_parallel_world_size()
         ctx.rank = get_sequence_parallel_rank()
-        return cp_gather(tensor, dim, validate=False)
+        return sp_gather(tensor, dim, validate=False)
 
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
@@ -288,10 +291,10 @@ class AllGatherFunction(torch.autograd.Function):
         return grad_chunks[ctx.rank].contiguous(), None
 
 
-def cp_gather_with_grad(tensor: torch.Tensor, dim: int) -> torch.Tensor:
+def sp_gather_with_grad(tensor: torch.Tensor, dim: int) -> torch.Tensor:
     """Gather tensor with proper gradient handling for training.
 
-    Use this instead of cp_gather when gradients need to flow back
+    Use this instead of sp_gather when gradients need to flow back
     correctly during training.
 
     Args:

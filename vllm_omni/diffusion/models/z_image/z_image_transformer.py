@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# _cp_plan definition adapted from HuggingFace diffusers library
+# _sp_plan definition adapted from HuggingFace diffusers library (_cp_plan)
 
 # Copyright 2025 Alibaba Z-Image Team and The HuggingFace Team. All rights reserved.
 #
@@ -33,9 +33,9 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.distributed.cp_plan import (
-    ContextParallelInput,
-    ContextParallelOutput,
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,
+    SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import (
     get_forward_context,
@@ -54,11 +54,11 @@ class UnifiedPrepare(nn.Module):
 
     This module encapsulates the unification of x and cap tensors into unified
     sequences. Similar to how Wan's `rope` module outputs rotary embeddings,
-    this module outputs unified tensors that can be sharded via _cp_plan's
+    this module outputs unified tensors that can be sharded via _sp_plan's
     split_output=True mechanism.
 
     This follows the diffusers pattern where tensor preparation happens in
-    a dedicated submodule, enabling _cp_plan hooks to work at module boundaries.
+    a dedicated submodule, enabling _sp_plan hooks to work at module boundaries.
     """
 
     def forward(
@@ -523,44 +523,48 @@ class RopeEmbedder:
 class ZImageTransformer2DModel(nn.Module):
     """Z-Image Transformer model for image generation.
 
-    Context Parallelism:
-        This model supports non-intrusive CP via _cp_plan. The plan specifies:
+    Sequence Parallelism:
+        This model supports non-intrusive SP via _sp_plan. The plan specifies:
         - Input splitting at first main transformer block (unified sequence)
         - RoPE (cos/sin) splitting along sequence dimension
         - Attention mask splitting along sequence dimension
         - Output gathering at final_layer
 
-        The CP is applied to the main `layers` transformer blocks where the
+        The SP is applied to the main `layers` transformer blocks where the
         unified image+caption sequence is processed jointly.
 
         Note: noise_refiner and context_refiner are NOT parallelized as they
         process image and caption separately before unification.
 
-        Important: The default _cp_plan assumes patch_size=2 and f_patch_size=1.
-        If using different patch configurations, update _cp_plan accordingly.
+        Important: The default _sp_plan assumes patch_size=2 and f_patch_size=1.
+        If using different patch configurations, update _sp_plan accordingly.
+
+        Note: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
     """
 
     _repeated_blocks = ["ZImageTransformerBlock"]
 
-    # Context Parallelism for Z-Image (following diffusers pattern)
+    # Sequence Parallelism for Z-Image (following diffusers' _cp_plan pattern)
     # Similar to how Wan uses `rope` module's split_output to shard rotary embeddings,
     # Z-Image uses `unified_prepare` module's split_output to shard unified tensors.
     #
-    # The _cp_plan specifies sharding/gathering at module boundaries:
+    # The _sp_plan specifies sharding/gathering at module boundaries:
     # - unified_prepare: Split all 4 outputs (unified, cos, sin, attn_mask) via split_output=True
     # - layers.0: hidden_states input is already sharded from unified_prepare output
     # - all_final_layer.2-1: Gather outputs after the final layer
-    _cp_plan = {
+    #
+    # Note: _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism)
+    _sp_plan = {
         # Shard unified_prepare outputs (similar to Wan's rope module)
         # This shards all 4 return values: unified, unified_cos, unified_sin, unified_attn_mask
         "unified_prepare": {
-            0: ContextParallelInput(split_dim=1, expected_dims=3, split_output=True),  # unified
-            1: ContextParallelInput(split_dim=1, expected_dims=3, split_output=True),  # unified_cos
-            2: ContextParallelInput(split_dim=1, expected_dims=3, split_output=True),  # unified_sin
-            3: ContextParallelInput(split_dim=1, expected_dims=2, split_output=True),  # unified_attn_mask
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),  # unified
+            1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),  # unified_cos
+            2: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),  # unified_sin
+            3: SequenceParallelInput(split_dim=1, expected_dims=2, split_output=True),  # unified_attn_mask
         },
         # Gather output at final_layer (default: patch_size=2, f_patch_size=1)
-        "all_final_layer.2-1": ContextParallelOutput(gather_dim=1, expected_dims=3),
+        "all_final_layer.2-1": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
 
     def __init__(

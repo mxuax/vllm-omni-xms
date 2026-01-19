@@ -8,9 +8,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.cp_config import ContextParallelConfig
-from vllm_omni.diffusion.distributed.cp_plan import get_cp_plan_from_model
-from vllm_omni.diffusion.hooks.context_parallel import apply_context_parallel
+from vllm_omni.diffusion.distributed.sp_config import SequenceParallelConfig
+from vllm_omni.diffusion.distributed.sp_plan import get_sp_plan_from_model
+from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
 
 logger = init_logger(__name__)
 
@@ -104,7 +104,7 @@ def initialize_model(
     1. Loads the model class from the registry
     2. Instantiates the model with the config
     3. Configures VAE optimization settings
-    4. Applies context parallelism if enabled (similar to diffusers' enable_parallelism)
+    4. Applies sequence parallelism if enabled (similar to diffusers' enable_parallelism)
 
     Args:
         od_config: The OmniDiffusion configuration.
@@ -124,22 +124,25 @@ def initialize_model(
         if hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
 
-        # Apply context parallelism if enabled
+        # Apply sequence parallelism if enabled
         # This follows diffusers' pattern where enable_parallelism() is called
         # at model loading time, not inside individual model files
-        _apply_context_parallel_if_enabled(model, od_config)
+        _apply_sequence_parallel_if_enabled(model, od_config)
 
         return model
     else:
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
 
 
-def _apply_context_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
-    """Apply context parallelism hooks if SP is enabled.
+def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
+    """Apply sequence parallelism hooks if SP is enabled.
 
-    This is the centralized location for enabling CP, similar to diffusers'
-    ModelMixin.enable_parallelism() method. It applies _cp_plan hooks to
+    This is the centralized location for enabling SP, similar to diffusers'
+    ModelMixin.enable_parallelism() method. It applies _sp_plan hooks to
     transformer models that define them.
+
+    Note: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
+    We use _sp_plan instead of diffusers' _cp_plan.
 
     Args:
         model: The pipeline model (e.g., ZImagePipeline).
@@ -151,7 +154,7 @@ def _apply_context_parallel_if_enabled(model, od_config: OmniDiffusionConfig) ->
         if sp_size <= 1:
             return
 
-        # Find transformer model(s) in the pipeline that have _cp_plan
+        # Find transformer model(s) in the pipeline that have _sp_plan
         transformer_attrs = ["transformer", "dit", "unet"]
         for attr in transformer_attrs:
             if not hasattr(model, attr):
@@ -161,12 +164,12 @@ def _apply_context_parallel_if_enabled(model, od_config: OmniDiffusionConfig) ->
             if transformer is None:
                 continue
 
-            plan = get_cp_plan_from_model(transformer)
+            plan = get_sp_plan_from_model(transformer)
             if plan is None:
                 continue
 
-            # Create CP config
-            cp_config = ContextParallelConfig(
+            # Create SP config
+            sp_config = SequenceParallelConfig(
                 ulysses_degree=od_config.parallel_config.ulysses_degree,
                 ring_degree=od_config.parallel_config.ring_degree,
             )
@@ -174,18 +177,18 @@ def _apply_context_parallel_if_enabled(model, od_config: OmniDiffusionConfig) ->
             # Apply hooks according to the plan
             mode = (
                 "hybrid"
-                if cp_config.ulysses_degree > 1 and cp_config.ring_degree > 1
-                else ("ulysses" if cp_config.ulysses_degree > 1 else "ring")
+                if sp_config.ulysses_degree > 1 and sp_config.ring_degree > 1
+                else ("ulysses" if sp_config.ulysses_degree > 1 else "ring")
             )
             logger.info(
-                f"Applying context parallelism to {transformer.__class__.__name__} "
-                f"(sp_size={sp_size}, mode={mode}, ulysses={cp_config.ulysses_degree}, ring={cp_config.ring_degree})"
+                f"Applying sequence parallelism to {transformer.__class__.__name__} "
+                f"(sp_size={sp_size}, mode={mode}, ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree})"
             )
-            apply_context_parallel(transformer, cp_config, plan)
+            apply_sequence_parallel(transformer, sp_config, plan)
             return  # Only apply to first transformer found
 
     except Exception as e:
-        logger.warning(f"Failed to apply context parallelism: {e}. Continuing without CP hooks.")
+        logger.warning(f"Failed to apply sequence parallelism: {e}. Continuing without SP hooks.")
 
 
 _DIFFUSION_POST_PROCESS_FUNCS = {

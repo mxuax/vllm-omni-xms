@@ -2,29 +2,32 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM and The HuggingFace Team
 # Type definitions in this module are adapted from HuggingFace diffusers library:
 #   diffusers/src/diffusers/models/_modeling_parallel.py
-"""Context Parallelism plan type definitions.
+#
+# NOTE: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
+# We use the term "Sequence Parallelism" to align with vLLM-Omni's existing terminology.
+"""Sequence Parallelism plan type definitions.
 
-This module defines the types used for declaring _cp_plan on model classes,
-enabling non-intrusive context parallelism support similar to diffusers.
+This module defines the types used for declaring _sp_plan on model classes,
+enabling non-intrusive sequence parallelism support similar to diffusers' _cp_plan.
 
-A _cp_plan is a dictionary that specifies how to shard/gather tensors at
+A _sp_plan is a dictionary that specifies how to shard/gather tensors at
 different points in a model's forward pass. This allows automatic handling
 of sequence parallelism without modifying the model's forward() method.
 
 Example:
     class MyTransformer(nn.Module):
-        _cp_plan = {
+        _sp_plan = {
             # Split inputs before model forward
             "": {
-                "hidden_states": ContextParallelInput(split_dim=1, expected_dims=3),
-                "encoder_hidden_states": ContextParallelInput(split_dim=1, expected_dims=3),
+                "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3),
+                "encoder_hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3),
             },
             # Split RoPE embeddings after pos_embed layer
             "pos_embed": {
-                0: ContextParallelInput(split_dim=0, expected_dims=2, split_output=True),
+                0: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True),
             },
             # Gather output after proj_out layer
-            "proj_out": ContextParallelOutput(gather_dim=1, expected_dims=3),
+            "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
         }
 """
 
@@ -38,11 +41,13 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
-class ContextParallelInput:
-    """Configuration for splitting an input tensor across context parallel ranks.
+class SequenceParallelInput:
+    """Configuration for splitting an input tensor across sequence parallel ranks.
 
     This specifies how to shard a tensor in the pre-forward or post-forward hook
     of a layer. The tensor will be split along the specified dimension.
+
+    Note: This corresponds to `ContextParallelInput` in diffusers library.
 
     Args:
         split_dim: The dimension along which to split the tensor.
@@ -55,10 +60,10 @@ class ContextParallelInput:
 
     Example:
         # Split hidden_states along sequence dimension (dim 1)
-        ContextParallelInput(split_dim=1, expected_dims=3)
+        SequenceParallelInput(split_dim=1, expected_dims=3)
 
         # Split RoPE output along sequence dimension (dim 0)
-        ContextParallelInput(split_dim=0, expected_dims=2, split_output=True)
+        SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True)
     """
 
     split_dim: int
@@ -67,17 +72,19 @@ class ContextParallelInput:
 
     def __repr__(self) -> str:
         return (
-            f"ContextParallelInput(split_dim={self.split_dim}, "
+            f"SequenceParallelInput(split_dim={self.split_dim}, "
             f"expected_dims={self.expected_dims}, split_output={self.split_output})"
         )
 
 
 @dataclass(frozen=True)
-class ContextParallelOutput:
-    """Configuration for gathering an output tensor across context parallel ranks.
+class SequenceParallelOutput:
+    """Configuration for gathering an output tensor across sequence parallel ranks.
 
     This specifies how to gather a tensor in the post-forward hook of a layer.
     The tensor will be gathered along the specified dimension from all ranks.
+
+    Note: This corresponds to `ContextParallelOutput` in diffusers library.
 
     Args:
         gather_dim: The dimension along which to gather the tensor.
@@ -86,18 +93,18 @@ class ContextParallelOutput:
 
     Example:
         # Gather output along sequence dimension (dim 1)
-        ContextParallelOutput(gather_dim=1, expected_dims=3)
+        SequenceParallelOutput(gather_dim=1, expected_dims=3)
     """
 
     gather_dim: int
     expected_dims: int | None = None
 
     def __repr__(self) -> str:
-        return f"ContextParallelOutput(gather_dim={self.gather_dim}, expected_dims={self.expected_dims})"
+        return f"SequenceParallelOutput(gather_dim={self.gather_dim}, expected_dims={self.expected_dims})"
 
 
 @dataclass(frozen=True)
-class ContextParallelPartialInput:
+class SequenceParallelPartialInput:
     """Configuration for partially splitting a tensor (e.g., split image part, keep text part).
 
     This is designed for models like LongCat/Qwen where RoPE embeddings need special handling:
@@ -105,6 +112,9 @@ class ContextParallelPartialInput:
     - Image portion: split across ranks
 
     The tensor is assumed to be concatenated as [text_part, image_part] along split_dim.
+
+    Note: This is an extension beyond diffusers' standard ContextParallelInput,
+    designed for vLLM-Omni's dual-stream attention models.
 
     Args:
         split_dim: The dimension along which to split the image portion.
@@ -116,7 +126,7 @@ class ContextParallelPartialInput:
 
     Example:
         # Split RoPE: text portion (from txt_ids.shape[0]) kept full, image portion split
-        ContextParallelPartialInput(
+        SequenceParallelPartialInput(
             split_dim=0,
             text_len_source="txt_ids",  # Get text length from txt_ids.shape[0]
             expected_dims=2,
@@ -124,7 +134,7 @@ class ContextParallelPartialInput:
         )
 
         # Or with fixed text length
-        ContextParallelPartialInput(
+        SequenceParallelPartialInput(
             split_dim=0,
             text_len_source=512,  # Fixed text length
             expected_dims=2,
@@ -139,36 +149,54 @@ class ContextParallelPartialInput:
 
     def __repr__(self) -> str:
         return (
-            f"ContextParallelPartialInput(split_dim={self.split_dim}, "
+            f"SequenceParallelPartialInput(split_dim={self.split_dim}, "
             f"text_len_source={self.text_len_source!r}, expected_dims={self.expected_dims}, "
             f"split_output={self.split_output})"
         )
 
 
-# Type aliases for _cp_plan structure
+# Type aliases for _sp_plan structure
+# These correspond to diffusers' _cp_plan type aliases.
 
 # Any input config type
-AnyContextParallelInput = ContextParallelInput | ContextParallelPartialInput
+AnySequenceParallelInput = SequenceParallelInput | SequenceParallelPartialInput
 
 # Input specification: maps parameter names (str) or output indices (int) to split config
-ContextParallelInputType = dict[
+SequenceParallelInputType = dict[
     str | int,
-    AnyContextParallelInput | list[AnyContextParallelInput] | tuple[AnyContextParallelInput, ...],
+    AnySequenceParallelInput | list[AnySequenceParallelInput] | tuple[AnySequenceParallelInput, ...],
 ]
 
 # Output specification: single or multiple gather configs
-ContextParallelOutputType = ContextParallelOutput | list[ContextParallelOutput] | tuple[ContextParallelOutput, ...]
+SequenceParallelOutputType = SequenceParallelOutput | list[SequenceParallelOutput] | tuple[SequenceParallelOutput, ...]
 
 # Full model plan: maps module names to input/output specifications
 # - Key "" refers to the model itself (root level)
 # - Key "module_name" refers to a submodule
 # - Key "module_name.*" refers to all children of a ModuleList
-ContextParallelModelPlan = dict[str, ContextParallelInputType | ContextParallelOutputType]
+#
+# Example of a complete _sp_plan:
+#
+#     _sp_plan = {
+#         # Root level: split model inputs before any submodule
+#         "": {
+#             "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3),
+#         },
+#         # Submodule: split outputs of pos_embed (RoPE) layer
+#         "pos_embed": {
+#             0: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),  # cos
+#             1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),  # sin
+#         },
+#         # Submodule: gather outputs of proj_out layer
+#         "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+#     }
+#
+SequenceParallelModelPlan = dict[str, SequenceParallelInputType | SequenceParallelOutputType]
 
 
 def _is_valid_input_config(value: object) -> bool:
     """Check if a value is a valid input configuration type."""
-    return isinstance(value, (ContextParallelInput, ContextParallelPartialInput))
+    return isinstance(value, (SequenceParallelInput, SequenceParallelPartialInput))
 
 
 def _is_valid_input_config_list(value: object) -> bool:
@@ -178,27 +206,27 @@ def _is_valid_input_config_list(value: object) -> bool:
     return all(_is_valid_input_config(x) for x in value)
 
 
-def validate_cp_plan(plan: ContextParallelModelPlan) -> None:
-    """Validate a _cp_plan dictionary for correctness.
+def validate_sp_plan(plan: SequenceParallelModelPlan) -> None:
+    """Validate a _sp_plan dictionary for correctness.
 
     Args:
-        plan: The _cp_plan dictionary to validate.
+        plan: The _sp_plan dictionary to validate.
 
     Raises:
         ValueError: If the plan is invalid.
     """
     if not isinstance(plan, dict):
-        raise ValueError(f"_cp_plan must be a dict, got {type(plan).__name__}")
+        raise ValueError(f"_sp_plan must be a dict, got {type(plan).__name__}")
 
     for module_id, module_plan in plan.items():
         if not isinstance(module_id, str):
-            raise ValueError(f"_cp_plan keys must be strings, got {type(module_id).__name__}")
+            raise ValueError(f"_sp_plan keys must be strings, got {type(module_id).__name__}")
 
-        # Check if it's an output specification (ContextParallelOutput or list/tuple thereof)
-        if isinstance(module_plan, ContextParallelOutput):
+        # Check if it's an output specification (SequenceParallelOutput or list/tuple thereof)
+        if isinstance(module_plan, SequenceParallelOutput):
             continue
         if isinstance(module_plan, (list, tuple)):
-            if all(isinstance(x, ContextParallelOutput) for x in module_plan):
+            if all(isinstance(x, SequenceParallelOutput) for x in module_plan):
                 continue
             if _is_valid_input_config_list(module_plan):
                 # List of inputs for a specific parameter (when output is tuple)
@@ -213,7 +241,7 @@ def validate_cp_plan(plan: ContextParallelModelPlan) -> None:
                     )
                 if isinstance(key, int) and not _is_valid_input_config(value):
                     raise ValueError(
-                        f"Integer keys (output indices) must map to ContextParallelInput/PartialInput, "
+                        f"Integer keys (output indices) must map to SequenceParallelInput/PartialInput, "
                         f"got {type(value).__name__} for module '{module_id}'[{key}]"
                     )
                 if _is_valid_input_config(value):
@@ -226,26 +254,26 @@ def validate_cp_plan(plan: ContextParallelModelPlan) -> None:
                     pass  # Valid list of input configs
                 else:
                     raise ValueError(
-                        f"Input spec values must be ContextParallelInput/PartialInput or list thereof, "
+                        f"Input spec values must be SequenceParallelInput/PartialInput or list thereof, "
                         f"got {type(value).__name__} for module '{module_id}'['{key}']"
                     )
         else:
             raise ValueError(
-                f"_cp_plan values must be dict (input spec) or ContextParallelOutput, "
+                f"_sp_plan values must be dict (input spec) or SequenceParallelOutput, "
                 f"got {type(module_plan).__name__} for module '{module_id}'"
             )
 
 
-def get_cp_plan_from_model(model: nn.Module) -> ContextParallelModelPlan | None:
-    """Get the _cp_plan from a model if it exists.
+def get_sp_plan_from_model(model: nn.Module) -> SequenceParallelModelPlan | None:
+    """Get the _sp_plan from a model if it exists.
 
     Args:
         model: The model to get the plan from.
 
     Returns:
-        The _cp_plan dictionary, or None if not defined.
+        The _sp_plan dictionary, or None if not defined.
     """
-    plan = getattr(model, "_cp_plan", None)
+    plan = getattr(model, "_sp_plan", None)
     if plan is not None:
-        validate_cp_plan(plan)
+        validate_sp_plan(plan)
     return plan

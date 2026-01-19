@@ -1,41 +1,45 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Distributed utilities for vLLM-Omni diffusion models."""
+"""Distributed utilities for vLLM-Omni diffusion models.
 
-from vllm_omni.diffusion.distributed.cp_config import ContextParallelConfig
-from vllm_omni.diffusion.distributed.cp_plan import (
-    ContextParallelInput,
-    ContextParallelModelPlan,
-    ContextParallelOutput,
-    ContextParallelPartialInput,
-    get_cp_plan_from_model,
-    validate_cp_plan,
+NOTE: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
+We use the term "Sequence Parallelism" to align with vLLM-Omni's existing terminology.
+"""
+
+from vllm_omni.diffusion.distributed.sp_config import SequenceParallelConfig
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,
+    SequenceParallelModelPlan,
+    SequenceParallelOutput,
+    SequenceParallelPartialInput,
+    get_sp_plan_from_model,
+    validate_sp_plan,
 )
-from vllm_omni.diffusion.distributed.cp_sharding import (
+from vllm_omni.diffusion.distributed.sp_sharding import (
     AllGatherFunction,
     ShardingValidator,
-    cp_gather,
-    cp_gather_with_grad,
-    cp_shard,
-    cp_shard_with_padding,
     get_sharding_validator,
+    sp_gather,
+    sp_gather_with_grad,
+    sp_shard,
+    sp_shard_with_padding,
 )
 
 __all__ = [
     # Config
-    "ContextParallelConfig",
+    "SequenceParallelConfig",
     # Plan types
-    "ContextParallelInput",
-    "ContextParallelOutput",
-    "ContextParallelPartialInput",
-    "ContextParallelModelPlan",
-    "validate_cp_plan",
-    "get_cp_plan_from_model",
+    "SequenceParallelInput",
+    "SequenceParallelOutput",
+    "SequenceParallelPartialInput",
+    "SequenceParallelModelPlan",
+    "validate_sp_plan",
+    "get_sp_plan_from_model",
     # Sharding utilities
-    "cp_shard",
-    "cp_gather",
-    "cp_shard_with_padding",
-    "cp_gather_with_grad",
+    "sp_shard",
+    "sp_gather",
+    "sp_shard_with_padding",
+    "sp_gather_with_grad",
     "AllGatherFunction",
     "ShardingValidator",
     "get_sharding_validator",
