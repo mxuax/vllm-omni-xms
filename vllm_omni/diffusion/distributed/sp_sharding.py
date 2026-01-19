@@ -5,12 +5,6 @@
 This module provides low-level sharding and gathering functions for
 Sequence Parallelism. These can be used directly in model forward methods
 for semi-intrusive SP support, or internally by the SP hooks.
-
-NOTE: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
-We use the term "Sequence Parallelism" to align with vLLM-Omni's existing terminology.
-
-The functions use vLLM-Omni's existing SequenceParallelGroupCoordinator
-for communication instead of PyTorch's DeviceMesh.
 """
 
 from __future__ import annotations

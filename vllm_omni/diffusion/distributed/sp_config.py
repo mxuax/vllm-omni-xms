@@ -5,9 +5,6 @@
 This module provides configuration classes for Sequence Parallelism (SP),
 adapting the diffusers-style _cp_plan mechanism to use vLLM-Omni's existing
 parallel state management (SequenceParallelGroupCoordinator).
-
-NOTE: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
-We use the term "Sequence Parallelism" to align with vLLM-Omni's existing terminology.
 """
 
 from __future__ import annotations

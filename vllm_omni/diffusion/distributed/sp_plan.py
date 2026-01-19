@@ -2,9 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM and The HuggingFace Team
 # Type definitions in this module are adapted from HuggingFace diffusers library:
 #   diffusers/src/diffusers/models/_modeling_parallel.py
-#
-# NOTE: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
-# We use the term "Sequence Parallelism" to align with vLLM-Omni's existing terminology.
 """Sequence Parallelism plan type definitions.
 
 This module defines the types used for declaring _sp_plan on model classes,
