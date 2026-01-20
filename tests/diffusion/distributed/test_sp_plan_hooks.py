@@ -964,14 +964,15 @@ class TestDimensionValidation:
 class TestSequenceParallelConfig:
     """Test SequenceParallelConfig dataclass."""
 
-    def test_config_defaults(self):
-        """Test SequenceParallelConfig default values."""
+    def test_config_defaults_invalid(self):
+        """Test that SequenceParallelConfig with default values raises error.
+
+        At least one of ulysses_degree or ring_degree must be > 1 to enable SP.
+        """
         from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
 
-        config = SequenceParallelConfig()
-        assert config.ulysses_degree == 1
-        assert config.ring_degree == 1
-        assert config.sequence_parallel_size == 1
+        with pytest.raises(ValueError, match="must be > 1"):
+            SequenceParallelConfig()  # Both defaults are 1, which is invalid
 
     def test_config_ulysses_only(self):
         """Test SequenceParallelConfig with Ulysses only."""
