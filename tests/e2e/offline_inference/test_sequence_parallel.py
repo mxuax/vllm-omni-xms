@@ -7,21 +7,17 @@ System test for Ulysses sequence parallel backend.
 This test verifies that Ulysses-SP (DeepSpeed Ulysses Sequence Parallel) works
 correctly with diffusion models. It uses minimal settings to keep test time
 short for CI.
-
-Note: Each Omni instance is run in a separate subprocess to ensure clean
-distributed environment initialization and cleanup.
 """
 
 import os
-import pickle
-import subprocess
 import sys
-import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
 from PIL import Image
 
 # ruff: noqa: E402
@@ -29,7 +25,10 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from vllm_omni import Omni
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed.parallel_state import device_count
+from vllm_omni.diffusion.envs import get_device_name
 
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
@@ -37,114 +36,6 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 models = ["riverclouds/qwen_image_random"]
 
 PROMPT = "a photo of a cat sitting on a laptop keyboard"
-
-
-def _run_inference_in_subprocess(
-    model_name: str,
-    ulysses_degree: int,
-    ring_degree: int,
-    dtype_str: str,
-    attn_backend: str,
-    height: int,
-    width: int,
-    num_inference_steps: int,
-    seed: int,
-    output_file: str,
-) -> None:
-    """Run inference in a separate subprocess and save the image to a file.
-
-    This ensures complete isolation of distributed environment between runs.
-    For SP mode (ulysses_degree > 1 or ring_degree > 1), uses torchrun to
-    properly initialize the distributed environment.
-    """
-    sp_size = ulysses_degree * ring_degree
-
-    # Create a temporary script file (needed for torchrun)
-    script_content = f'''
-import os
-import pickle
-import torch
-
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
-
-from vllm_omni import Omni
-from vllm_omni.diffusion.data import DiffusionParallelConfig
-from vllm_omni.diffusion.envs import get_device_name
-
-# Only rank 0 saves the output
-rank = int(os.environ.get("RANK", "0"))
-
-dtype = getattr(torch, "{dtype_str}")
-parallel_config = DiffusionParallelConfig(ulysses_degree={ulysses_degree}, ring_degree={ring_degree})
-
-omni = Omni(
-    model="{model_name}",
-    parallel_config=parallel_config,
-    dtype=dtype,
-    attention_backend="{attn_backend}",
-)
-
-try:
-    outputs = omni.generate(
-        "{PROMPT}",
-        height={height},
-        width={width},
-        num_inference_steps={num_inference_steps},
-        guidance_scale=0.0,
-        generator=torch.Generator(get_device_name()).manual_seed({seed}),
-        num_outputs_per_prompt=1,
-    )
-    images = outputs[0].request_output[0].images
-
-    # Only rank 0 saves the output
-    if rank == 0:
-        with open("{output_file}", "wb") as f:
-            pickle.dump(images, f)
-finally:
-    omni.close()
-'''
-
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
-
-    # Write script to a temporary file
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-        f.write(script_content)
-        script_file = f.name
-
-    try:
-        if sp_size > 1:
-            # Use torchrun for multi-GPU SP mode
-            cmd = [
-                sys.executable,
-                "-m",
-                "torch.distributed.run",
-                f"--nproc_per_node={sp_size}",
-                "--master_port=29500",
-                script_file,
-            ]
-        else:
-            # Single GPU mode - run directly
-            cmd = [sys.executable, script_file]
-
-        result = subprocess.run(
-            cmd,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=600,  # 10 minute timeout
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Subprocess failed with return code {result.returncode}\n"
-                f"stdout: {result.stdout}\n"
-                f"stderr: {result.stderr}"
-            )
-    finally:
-        # Clean up the temporary script file
-        if os.path.exists(script_file):
-            os.remove(script_file)
 
 
 def _pil_to_float_rgb_tensor(img: Image.Image) -> torch.Tensor:
@@ -162,10 +53,185 @@ def _diff_metrics(a: Image.Image, b: Image.Image) -> tuple[float, float]:
     return abs_diff.mean().item(), abs_diff.max().item()
 
 
+def _cleanup_distributed():
+    """Clean up distributed environment."""
+    print("[DEBUG] Cleaning up distributed environment...")
+    if dist.is_initialized():
+        print("[DEBUG] Destroying process group...")
+        dist.destroy_process_group()
+    for key in ["MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"]:
+        os.environ.pop(key, None)
+    print("[DEBUG] Cleanup done, waiting 3 seconds...")
+    time.sleep(3)
+
+
+def _run_baseline(model_name: str, dtype: torch.dtype, attn_backend: str, height: int, width: int, seed: int):
+    """Run baseline inference (no SP)."""
+    print(f"\n{'=' * 60}")
+    print("[DEBUG] Starting BASELINE inference (ulysses=1, ring=1)")
+    print(f"[DEBUG] Model: {model_name}")
+    print(f"[DEBUG] dtype: {dtype}, backend: {attn_backend}")
+    print(f"[DEBUG] height: {height}, width: {width}, seed: {seed}")
+    print(f"{'=' * 60}")
+
+    baseline_parallel_config = DiffusionParallelConfig(ulysses_degree=1, ring_degree=1)
+    print("[DEBUG] Creating Omni instance...")
+
+    baseline = Omni(
+        model=model_name,
+        parallel_config=baseline_parallel_config,
+        dtype=dtype,
+        attention_backend=attn_backend,
+    )
+    print("[DEBUG] Omni instance created successfully")
+
+    try:
+        print("[DEBUG] Running generate()...")
+        outputs = baseline.generate(
+            PROMPT,
+            height=height,
+            width=width,
+            num_inference_steps=4,
+            guidance_scale=0.0,
+            generator=torch.Generator(get_device_name()).manual_seed(seed),
+            num_outputs_per_prompt=1,
+        )
+        print("[DEBUG] Generate completed")
+        images = outputs[0].request_output[0].images
+        print(f"[DEBUG] Got {len(images)} image(s)")
+        return images
+    finally:
+        print("[DEBUG] Closing Omni instance...")
+        baseline.close()
+        print("[DEBUG] Omni instance closed")
+        _cleanup_distributed()
+
+
+def _run_sp(
+    model_name: str,
+    dtype: torch.dtype,
+    attn_backend: str,
+    height: int,
+    width: int,
+    seed: int,
+    ulysses_degree: int,
+    ring_degree: int,
+):
+    """Run SP inference."""
+    print(f"\n{'=' * 60}")
+    print(f"[DEBUG] Starting SP inference (ulysses={ulysses_degree}, ring={ring_degree})")
+    print(f"[DEBUG] Model: {model_name}")
+    print(f"[DEBUG] dtype: {dtype}, backend: {attn_backend}")
+    print(f"[DEBUG] height: {height}, width: {width}, seed: {seed}")
+    print(f"{'=' * 60}")
+
+    sp_parallel_config = DiffusionParallelConfig(ulysses_degree=ulysses_degree, ring_degree=ring_degree)
+    print("[DEBUG] Creating Omni instance...")
+
+    sp = Omni(
+        model=model_name,
+        parallel_config=sp_parallel_config,
+        dtype=dtype,
+        attention_backend=attn_backend,
+    )
+    print("[DEBUG] Omni instance created successfully")
+
+    try:
+        print("[DEBUG] Running generate()...")
+        outputs = sp.generate(
+            PROMPT,
+            height=height,
+            width=width,
+            num_inference_steps=4,
+            guidance_scale=0.0,
+            generator=torch.Generator(get_device_name()).manual_seed(seed),
+            num_outputs_per_prompt=1,
+        )
+        print("[DEBUG] Generate completed")
+        images = outputs[0].request_output[0].images
+        print(f"[DEBUG] Got {len(images)} image(s)")
+        return images
+    finally:
+        print("[DEBUG] Closing Omni instance...")
+        sp.close()
+        print("[DEBUG] Omni instance closed")
+        _cleanup_distributed()
+
+
+# ============================================================================
+# Individual tests - can be run separately
+# ============================================================================
+
+
+@pytest.mark.parametrize("model_name", models)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("attn_backend", ["sdpa"])
+def test_baseline_only(model_name: str, dtype: torch.dtype, attn_backend: str):
+    """Test baseline inference only (no SP) - for debugging."""
+    height = 256
+    width = 256
+    seed = 42
+
+    images = _run_baseline(model_name, dtype, attn_backend, height, width, seed)
+
+    assert images is not None
+    assert len(images) == 1
+    assert images[0].width == width
+    assert images[0].height == height
+    print("[DEBUG] test_baseline_only PASSED")
+
+
+@pytest.mark.parametrize("model_name", models)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("attn_backend", ["sdpa"])
+def test_sp_ulysses2_only(model_name: str, dtype: torch.dtype, attn_backend: str):
+    """Test SP inference only (ulysses=2) - for debugging."""
+    if device_count() < 2:
+        pytest.skip(f"Test requires 2 GPUs but only {device_count()} available")
+
+    height = 256
+    width = 256
+    seed = 42
+
+    images = _run_sp(model_name, dtype, attn_backend, height, width, seed, ulysses_degree=2, ring_degree=1)
+
+    assert images is not None
+    assert len(images) == 1
+    assert images[0].width == width
+    assert images[0].height == height
+    print("[DEBUG] test_sp_ulysses2_only PASSED")
+
+
+@pytest.mark.parametrize("model_name", models)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("attn_backend", ["sdpa"])
+def test_sp_ring2_only(model_name: str, dtype: torch.dtype, attn_backend: str):
+    """Test SP inference only (ring=2) - for debugging."""
+    if device_count() < 2:
+        pytest.skip(f"Test requires 2 GPUs but only {device_count()} available")
+
+    height = 256
+    width = 256
+    seed = 42
+
+    images = _run_sp(model_name, dtype, attn_backend, height, width, seed, ulysses_degree=1, ring_degree=2)
+
+    assert images is not None
+    assert len(images) == 1
+    assert images[0].width == width
+    assert images[0].height == height
+    print("[DEBUG] test_sp_ring2_only PASSED")
+
+
+# ============================================================================
+# Comparison tests
+# ============================================================================
+
+
 @pytest.mark.parametrize("model_name", models)
 @pytest.mark.parametrize("ulysses_degree", [1, 2])
 @pytest.mark.parametrize("ring_degree", [1, 2])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])  # Only test bfloat16 to reduce CI time
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("attn_backend", ["sdpa"])
 def test_sequence_parallel(
     model_name: str,
@@ -174,214 +240,81 @@ def test_sequence_parallel(
     dtype: torch.dtype,
     attn_backend: str,
 ):
-    """Compare baseline (ulysses_degree=1) vs SP (ulysses_degree>1) outputs.
-
-    Each inference run is executed in a separate subprocess to ensure complete
-    isolation of distributed environment and GPU resources.
-    """
+    """Compare baseline (ulysses_degree=1) vs SP (ulysses_degree>1) outputs."""
     if ulysses_degree <= 1 and ring_degree <= 1:
         pytest.skip(
             "This test compares ulysses_degree * ring_degree = 1 vs ulysses_degree * ring_degree > 1; "
             "provide ulysses_degree or ring_degree>1."
         )
 
-    # Skip if not enough GPUs available for SP run
-    if device_count() < ulysses_degree * ring_degree:
-        pytest.skip(f"Test requires {ulysses_degree * ring_degree} GPUs but only {device_count()} available")
+    sp_size = ulysses_degree * ring_degree
+    if device_count() < sp_size:
+        pytest.skip(f"Test requires {sp_size} GPUs but only {device_count()} available")
 
-    # Use minimal settings for fast testing
     height = 256
     width = 256
-    num_inference_steps = 4  # Minimal steps for fast test
     seed = 42
-    dtype_str = str(dtype).split(".")[-1]  # "torch.bfloat16" -> "bfloat16"
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
-        baseline_output_file = f.name
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
-        sp_output_file = f.name
+    # Step 1: Baseline
+    baseline_images = _run_baseline(model_name, dtype, attn_backend, height, width, seed)
+    assert baseline_images is not None and len(baseline_images) == 1
 
-    try:
-        # Step 1: Baseline (no sequence parallel) - run in subprocess
-        print("\n[Baseline] Running with ulysses_degree=1, ring_degree=1...")
-        _run_inference_in_subprocess(
-            model_name=model_name,
-            ulysses_degree=1,
-            ring_degree=1,
-            dtype_str=dtype_str,
-            attn_backend=attn_backend,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            seed=seed,
-            output_file=baseline_output_file,
-        )
+    # Step 2: SP
+    sp_images = _run_sp(model_name, dtype, attn_backend, height, width, seed, ulysses_degree, ring_degree)
+    assert sp_images is not None and len(sp_images) == 1
 
-        with open(baseline_output_file, "rb") as f:
-            baseline_images = pickle.load(f)
+    # Step 3: Compare
+    mean_abs_diff, max_abs_diff = _diff_metrics(baseline_images[0], sp_images[0])
 
-        assert baseline_images is not None
-        assert len(baseline_images) == 1
-        assert baseline_images[0].width == width
-        assert baseline_images[0].height == height
+    mean_threshold = 2e-2
+    max_threshold = 2e-1
 
-        # Step 2: SP (Ulysses-SP + Ring-SP) - run in subprocess
-        print(f"\n[SP] Running with ulysses_degree={ulysses_degree}, ring_degree={ring_degree}...")
-        _run_inference_in_subprocess(
-            model_name=model_name,
-            ulysses_degree=ulysses_degree,
-            ring_degree=ring_degree,
-            dtype_str=dtype_str,
-            attn_backend=attn_backend,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            seed=seed,
-            output_file=sp_output_file,
-        )
+    print(
+        f"\n[DEBUG] Image diff: mean={mean_abs_diff:.6e}, max={max_abs_diff:.6e}; "
+        f"thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e}"
+    )
 
-        with open(sp_output_file, "rb") as f:
-            sp_images = pickle.load(f)
-
-        assert sp_images is not None
-        assert len(sp_images) == 1
-        assert sp_images[0].width == width
-        assert sp_images[0].height == height
-
-        # Step 3: Compare outputs
-        mean_abs_diff, max_abs_diff = _diff_metrics(baseline_images[0], sp_images[0])
-
-        # FP16/BF16 may differ slightly due to different computation order under parallelism.
-        if dtype in (torch.float16, torch.bfloat16):
-            mean_threshold = 2e-2
-            max_threshold = 2e-1
-        else:
-            mean_threshold = 1e-2
-            max_threshold = 1e-1
-
-        print(
-            "Image diff stats (baseline ulysses_degree*ring_degree=1 vs SP): "
-            f"mean_abs_diff={mean_abs_diff:.6e}, max_abs_diff={max_abs_diff:.6e}; "
-            f"thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e}; "
-            f"ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, dtype={dtype}"
-        )
-
-        assert mean_abs_diff <= mean_threshold and max_abs_diff <= max_threshold, (
-            f"Image diff exceeded threshold: mean_abs_diff={mean_abs_diff:.6e}, max_abs_diff={max_abs_diff:.6e} "
-            f"(thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e}); "
-            f"ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, dtype={dtype}"
-        )
-    finally:
-        # Cleanup temporary files
-        for f in [baseline_output_file, sp_output_file]:
-            if os.path.exists(f):
-                os.remove(f)
+    assert mean_abs_diff <= mean_threshold and max_abs_diff <= max_threshold, (
+        f"Image diff exceeded threshold: mean={mean_abs_diff:.6e}, max={max_abs_diff:.6e}"
+    )
+    print("[DEBUG] test_sequence_parallel PASSED")
 
 
 @pytest.mark.parametrize("model_name", models)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("attn_backend", ["sdpa"])
-def test_sequence_parallel_ulysses_sp_only(
-    model_name: str,
-    dtype: torch.dtype,
-    attn_backend: str,
-):
-    """Test sequence parallel with ulysses_degree=4, ring_degree=1.
-
-    Each inference run is executed in a separate subprocess to ensure complete
-    isolation of distributed environment and GPU resources.
-    """
+def test_sequence_parallel_ulysses4(model_name: str, dtype: torch.dtype, attn_backend: str):
+    """Test SP with ulysses_degree=4."""
     ulysses_degree = 4
     ring_degree = 1
 
-    # Skip if not enough GPUs available for SP run
     if device_count() < ulysses_degree * ring_degree:
         pytest.skip(f"Test requires {ulysses_degree * ring_degree} GPUs but only {device_count()} available")
 
-    # Test with 272x272 image size
     height = 272
     width = 272
-    num_inference_steps = 4  # Minimal steps for fast test
     seed = 42
-    dtype_str = str(dtype).split(".")[-1]  # "torch.bfloat16" -> "bfloat16"
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
-        baseline_output_file = f.name
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
-        sp_output_file = f.name
+    # Step 1: Baseline
+    baseline_images = _run_baseline(model_name, dtype, attn_backend, height, width, seed)
+    assert baseline_images is not None and len(baseline_images) == 1
 
-    try:
-        # Step 1: Baseline (no sequence parallel) - run in subprocess
-        print("\n[Baseline] Running with ulysses_degree=1, ring_degree=1...")
-        _run_inference_in_subprocess(
-            model_name=model_name,
-            ulysses_degree=1,
-            ring_degree=1,
-            dtype_str=dtype_str,
-            attn_backend=attn_backend,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            seed=seed,
-            output_file=baseline_output_file,
-        )
+    # Step 2: SP
+    sp_images = _run_sp(model_name, dtype, attn_backend, height, width, seed, ulysses_degree, ring_degree)
+    assert sp_images is not None and len(sp_images) == 1
 
-        with open(baseline_output_file, "rb") as f:
-            baseline_images = pickle.load(f)
+    # Step 3: Compare
+    mean_abs_diff, max_abs_diff = _diff_metrics(baseline_images[0], sp_images[0])
 
-        assert baseline_images is not None
-        assert len(baseline_images) == 1
-        assert baseline_images[0].width == width
-        assert baseline_images[0].height == height
+    mean_threshold = 2e-2
+    max_threshold = 2e-1
 
-        # Step 2: SP (Ulysses-SP) - run in subprocess
-        print(f"\n[SP] Running with ulysses_degree={ulysses_degree}, ring_degree={ring_degree}...")
-        _run_inference_in_subprocess(
-            model_name=model_name,
-            ulysses_degree=ulysses_degree,
-            ring_degree=ring_degree,
-            dtype_str=dtype_str,
-            attn_backend=attn_backend,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            seed=seed,
-            output_file=sp_output_file,
-        )
+    print(
+        f"\n[DEBUG] Image diff: mean={mean_abs_diff:.6e}, max={max_abs_diff:.6e}; "
+        f"thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e}"
+    )
 
-        with open(sp_output_file, "rb") as f:
-            sp_images = pickle.load(f)
-
-        assert sp_images is not None
-        assert len(sp_images) == 1
-        assert sp_images[0].width == width
-        assert sp_images[0].height == height
-
-        # Step 3: Compare outputs
-        mean_abs_diff, max_abs_diff = _diff_metrics(baseline_images[0], sp_images[0])
-
-        # FP16/BF16 may differ slightly due to different computation order under parallelism.
-        if dtype in (torch.float16, torch.bfloat16):
-            mean_threshold = 2e-2
-            max_threshold = 2e-1
-        else:
-            mean_threshold = 1e-2
-            max_threshold = 1e-1
-
-        print(
-            "Image diff stats (baseline ulysses_degree*ring_degree=1 vs SP): "
-            f"mean_abs_diff={mean_abs_diff:.6e}, max_abs_diff={max_abs_diff:.6e}; "
-            f"thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e}; "
-            f"ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, dtype={dtype}"
-        )
-
-        assert mean_abs_diff <= mean_threshold and max_abs_diff <= max_threshold, (
-            f"Image diff exceeded threshold: mean_abs_diff={mean_abs_diff:.6e}, max_abs_diff={max_abs_diff:.6e} "
-            f"(thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e}); "
-            f"ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, dtype={dtype}"
-        )
-    finally:
-        # Cleanup temporary files
-        for f in [baseline_output_file, sp_output_file]:
-            if os.path.exists(f):
-                os.remove(f)
+    assert mean_abs_diff <= mean_threshold and max_abs_diff <= max_threshold, (
+        f"Image diff exceeded threshold: mean={mean_abs_diff:.6e}, max={max_abs_diff:.6e}"
+    )
+    print("[DEBUG] test_sequence_parallel_ulysses4 PASSED")

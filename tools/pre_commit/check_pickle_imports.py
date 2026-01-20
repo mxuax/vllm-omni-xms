@@ -18,7 +18,6 @@ import regex as re
 ALLOWED_FILES = {
     "vllm_omni/entrypoints/omni_llm.py",
     "tests/e2e/offline_inference/utils.py",
-    "tests/e2e/offline_inference/test_sequence_parallel.py",
     "tests/utils.py",
     "vllm_omni/diffusion/distributed/group_coordinator.py",
     "tests/diffusion/attention/test_attention_sp.py",
