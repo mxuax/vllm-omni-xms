@@ -54,8 +54,13 @@ def _run_inference_in_subprocess(
     """Run inference in a separate subprocess and save the image to a file.
 
     This ensures complete isolation of distributed environment between runs.
+    For SP mode (ulysses_degree > 1 or ring_degree > 1), uses torchrun to
+    properly initialize the distributed environment.
     """
-    script = f'''
+    sp_size = ulysses_degree * ring_degree
+
+    # Create a temporary script file (needed for torchrun)
+    script_content = f'''
 import os
 import pickle
 import torch
@@ -65,6 +70,9 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.envs import get_device_name
+
+# Only rank 0 saves the output
+rank = int(os.environ.get("RANK", "0"))
 
 dtype = getattr(torch, "{dtype_str}")
 parallel_config = DiffusionParallelConfig(ulysses_degree={ulysses_degree}, ring_degree={ring_degree})
@@ -88,9 +96,10 @@ try:
     )
     images = outputs[0].request_output[0].images
 
-    # Save images to file
-    with open("{output_file}", "wb") as f:
-        pickle.dump(images, f)
+    # Only rank 0 saves the output
+    if rank == 0:
+        with open("{output_file}", "wb") as f:
+            pickle.dump(images, f)
 finally:
     omni.close()
 '''
@@ -98,18 +107,44 @@ finally:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
 
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=600,  # 10 minute timeout
-    )
+    # Write script to a temporary file
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write(script_content)
+        script_file = f.name
 
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Subprocess failed with return code {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    try:
+        if sp_size > 1:
+            # Use torchrun for multi-GPU SP mode
+            cmd = [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                f"--nproc_per_node={sp_size}",
+                "--master_port=29500",
+                script_file,
+            ]
+        else:
+            # Single GPU mode - run directly
+            cmd = [sys.executable, script_file]
+
+        result = subprocess.run(
+            cmd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600,  # 10 minute timeout
         )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Subprocess failed with return code {result.returncode}\n"
+                f"stdout: {result.stdout}\n"
+                f"stderr: {result.stderr}"
+            )
+    finally:
+        # Clean up the temporary script file
+        if os.path.exists(script_file):
+            os.remove(script_file)
 
 
 def _pil_to_float_rgb_tensor(img: Image.Image) -> torch.Tensor:
