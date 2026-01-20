@@ -21,7 +21,7 @@ import torch.distributed as dist
 from PIL import Image
 
 # ruff: noqa: E402
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -212,7 +212,7 @@ def test_sequence_parallel_ulysses_sp_only(
     dtype: torch.dtype,
     attn_backend: str,
 ):
-    """Test sequence parallel with ulysses_degree=4, ring_degree=1, and the image size (332x332) where the sequence length is NOT divisible by sp_size."""
+    """Test sequence parallel with ulysses_degree=4, ring_degree=1, and the image size (232x232) where the sequence length is NOT divisible by sp_size."""
     ulysses_degree = 4
     ring_degree = 1
 
@@ -220,7 +220,7 @@ def test_sequence_parallel_ulysses_sp_only(
     if device_count() < ulysses_degree * ring_degree:
         pytest.skip(f"Test requires {ulysses_degree * ring_degree} GPUs but only {device_count()} available")
 
-    # (272/8) * (272/8) = 17 * 17 = 289 Not divisible by sp_size=4
+    # (272/(2*8)) * (272/(2*8)) = 17 * 17 = 289 Not divisible by sp_size=4
     height = 272
     width = 272
     num_inference_steps = 4  # Minimal steps for fast test
