@@ -43,11 +43,18 @@ requires_distributed = pytest.mark.skipif(
     reason="Requires initialized distributed environment (SP group)",
 )
 
+# Module-level markers: these tests are diffusion + parallel related
+pytestmark = [
+    pytest.mark.diffusion,
+    pytest.mark.parallel,
+]
+
 # =============================================================================
 # Tests for sp_plan.py
 # =============================================================================
 
 
+@pytest.mark.cpu
 class TestSequenceParallelPlanValidation:
     """Test _sp_plan validation logic."""
 
@@ -106,6 +113,7 @@ class TestSequenceParallelPlanValidation:
             validate_sp_plan(plan)
 
 
+@pytest.mark.cpu
 class TestGetSpPlanFromModel:
     """Test get_sp_plan_from_model utility."""
 
@@ -135,6 +143,7 @@ class TestGetSpPlanFromModel:
         assert plan is None
 
 
+@pytest.mark.cpu
 class TestSequenceParallelInputTypes:
     """Test SequenceParallelInput and related types."""
 
@@ -179,6 +188,7 @@ class TestSequenceParallelInputTypes:
 # =============================================================================
 
 
+@pytest.mark.cpu
 class TestModuleForwardMetadata:
     """Test ModuleForwardMetadata parameter resolution."""
 
@@ -239,6 +249,7 @@ class TestModuleForwardMetadata:
         assert metadata.cached_parameter_indices["c"] == 2
 
 
+@pytest.mark.cpu
 class TestGetSubmoduleByName:
     """Test _get_submodule_by_name function."""
 
@@ -346,6 +357,7 @@ class TestGetSubmoduleByName:
             _get_submodule_by_name(model, "a.*.b.*")
 
 
+@pytest.mark.cpu
 class TestHookRegistration:
     """Test hook registration logic (without distributed backend)."""
 
@@ -405,8 +417,13 @@ class TestHookRegistration:
 # =============================================================================
 
 
+@pytest.mark.L4
 class TestModelSpPlans:
-    """Test that model _sp_plan definitions are valid."""
+    """Test that model _sp_plan definitions are valid.
+
+    These tests import actual model classes to verify _sp_plan structure.
+    May require GPU for model imports.
+    """
 
     def test_zimage_transformer_sp_plan(self):
         """Test ZImageTransformer2DModel _sp_plan structure.
@@ -489,6 +506,7 @@ class TestModelSpPlans:
 # =============================================================================
 
 
+@pytest.mark.cpu
 class TestMockSharding:
     """Test tensor sharding logic (mocked, no distributed)."""
 
@@ -597,6 +615,7 @@ class TestMockSharding:
 # =============================================================================
 
 
+@pytest.mark.cpu
 class TestUnwrapModule:
     """Test _unwrap_module function."""
 
@@ -630,6 +649,7 @@ class TestUnwrapModule:
         assert result is inner
 
 
+@pytest.mark.cpu
 class TestSequenceParallelSplitHookInit:
     """Test SequenceParallelSplitHook initialization and setup."""
 
@@ -672,6 +692,7 @@ class TestSequenceParallelSplitHookInit:
         assert hook.module_forward_metadata._cls is DummyModule
 
 
+@pytest.mark.cpu
 class TestSequenceParallelGatherHookInit:
     """Test SequenceParallelGatherHook initialization."""
 
@@ -706,6 +727,7 @@ class TestSequenceParallelGatherHookInit:
         assert hook.metadata[1].gather_dim == 2
 
 
+@pytest.mark.cpu
 class TestResolveTextLen:
     """Test _resolve_text_len in SequenceParallelSplitHook."""
 
@@ -790,6 +812,7 @@ class TestResolveTextLen:
         assert text_len == 64
 
 
+@pytest.mark.cpu
 class TestHookNameTemplates:
     """Test hook name template generation."""
 
@@ -808,6 +831,7 @@ class TestHookNameTemplates:
         assert name == "sp_output---proj_out"
 
 
+@pytest.mark.cpu
 class TestApplyRemoveSequenceParallel:
     """Test apply_sequence_parallel and remove_sequence_parallel functions."""
 
@@ -931,6 +955,7 @@ class TestApplyRemoveSequenceParallel:
             assert _SP_INPUT_HOOK_TEMPLATE.format("blocks.*") in registry._hooks
 
 
+@pytest.mark.cpu
 class TestDimensionValidation:
     """Test expected_dims validation in hooks."""
 
@@ -961,6 +986,7 @@ class TestDimensionValidation:
         assert result.shape == tensor_4d.shape
 
 
+@pytest.mark.cpu
 class TestSequenceParallelConfig:
     """Test SequenceParallelConfig dataclass."""
 
