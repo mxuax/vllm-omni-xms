@@ -142,7 +142,7 @@ def sp_shard_with_padding(
     return sp_shard(tensor, dim, validate=False), pad_size
 
 
-# NOTE: This class is NOT from diffusers. It is a vLLM-Omni extension for
+# NOTE: This class is a vLLM-Omni extension for
 # debugging intrusive SP implementations.
 # Purpose:
 # - Help developers detect bugs when implementing intrusive SP

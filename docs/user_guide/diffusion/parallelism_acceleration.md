@@ -210,202 +210,139 @@ To measure the parallelism methods, we run benchmarks with **Qwen/Qwen-Image** m
 
 ##### How to parallelize a new model
 
-If a diffusion model has been deployed in vLLM-Omni and supports single-card inference, you can enable Sequence Parallelism (SP) using one of two approaches:
-
-!!! note "Terminology: SP vs CP"
-    Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in the diffusers library.
-    We use the term "Sequence Parallelism" to align with vLLM-Omni's existing terminology.
-
-1. **Non-intrusive `_sp_plan` approach** (Recommended): Define a `_sp_plan` class attribute that declaratively specifies how tensors should be sharded/gathered. The framework automatically applies hooks to handle the parallelism.
-
-2. **Intrusive modification approach** (For complex cases): Manually add sharding/gathering logic in the model's `forward()` method.
+NOTE: "Terminology: SP vs CP"
+    Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in the [diffusers library](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/_modeling_parallel.py).
+    We use "Sequence Parallelism" to align with vLLM-Omni's terminology.
 
 ---
 
-###### Method 1: Non-intrusive `_sp_plan` (Recommended)
+###### Non-intrusive `_sp_plan` (Recommended)
 
-The `_sp_plan` mechanism, inspired by the [diffusers library's `_cp_plan`](https://github.com/huggingface/diffusers), allows you to enable SP without modifying the core `forward()` logic. The framework automatically:
-- Shards input tensors before computation
-- Configures Attention layers for Ulysses/Ring communication
-- Gathers output tensors after computation
+The `_sp_plan` mechanism allows SP without modifying `forward()` logic. The framework automatically registers hooks to shard inputs and gather outputs at module boundaries.
 
-**Step 1: Understand the `_sp_plan` types**
+**Requirements for `forward()` function:**
+
+- Tensor operations that need sharding/gathering must happen at **`nn.Module` boundaries** (not inline Python operations)
+- If your `forward()` contains inline tensor operations (e.g., `torch.cat`, `pad_sequence`) that need sharding, **extract them into a submodule**
+
+**When to create a submodule:**
+
+```python
+# ❌ BAD: Inline operations - hooks cannot intercept
+def forward(self, x, cap_feats):
+    unified = torch.cat([x, cap_feats], dim=1)  # Cannot be sharded via _sp_plan
+    ...
+
+# ✅ GOOD: Extract into a submodule
+class UnifiedPrepare(nn.Module):
+    def forward(self, x, cap_feats):
+        return torch.cat([x, cap_feats], dim=1)  # Now can be sharded via _sp_plan
+
+class MyModel(nn.Module):
+    def __init__(self):
+        self.unified_prepare = UnifiedPrepare()  # Submodule
+
+    def forward(self, x, cap_feats):
+        unified = self.unified_prepare(x, cap_feats)  # Hook can intercept here
+```
+
+---
+
+###### Defining `_sp_plan`
+
+**Type definitions** (see [diffusers `_modeling_parallel.py`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/_modeling_parallel.py) for reference):
 
 ```python
 from vllm_omni.diffusion.distributed.sp_plan import (
-    SequenceParallelInput,    # For sharding inputs (corresponds to diffusers' ContextParallelInput)
-    SequenceParallelOutput,   # For gathering outputs (corresponds to diffusers' ContextParallelOutput)
-)
-
-# SequenceParallelInput: Shard a tensor along a dimension
-SequenceParallelInput(
-    split_dim=1,           # Dimension to split (usually sequence dim)
-    expected_dims=3,       # Expected tensor rank (for validation)
-    split_output=False,    # If True, shard the module's OUTPUT instead of input
-)
-
-# SequenceParallelOutput: Gather sharded outputs
-SequenceParallelOutput(
-    gather_dim=1,          # Dimension to gather
-    expected_dims=3,       # Expected tensor rank
+    SequenceParallelInput,   # Corresponds to diffusers' ContextParallelInput
+    SequenceParallelOutput,  # Corresponds to diffusers' ContextParallelOutput
 )
 ```
 
-**Step 2: Define `_sp_plan` for your model**
+| Parameter | Description |
+|-----------|-------------|
+| `split_dim` | Dimension to split/gather (usually `1` for sequence) |
+| `expected_dims` | Expected tensor rank for validation (optional) |
+| `split_output` | `False`: shard **input** parameters; `True`: shard **output** tensors |
+| `auto_pad` | Auto-pad if sequence not divisible by world_size (Ulysses only) |
 
-The `_sp_plan` is a dictionary mapping module names to their sharding/gathering specifications:
+**Key naming convention:**
+
+| Key | Meaning | Python equivalent |
+|-----|---------|-------------------|
+| `""` | Root model | `model` |
+| `"blocks.0"` | First element of ModuleList | `model.blocks[0]` |
+| `"blocks.*"` | All elements of ModuleList | `for b in model.blocks` |
+| `"outputs.main"` | ModuleDict entry | `model.outputs["main"]` |
+
+**Dictionary key types:**
+
+| Key type | `split_output` | Description |
+|----------|----------------|-------------|
+| `"param_name"` (str) | `False` | Shard **input parameter** by name |
+| `0`, `1` (int) | `True` | Shard **output tuple** by index |
+
+**Example** (similar to [diffusers `transformer_wan.py`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/transformers/transformer_wan.py)):
 
 ```python
-class MyTransformer2DModel(nn.Module):
-    # Note: _sp_plan corresponds to diffusers' _cp_plan
+class MyTransformer(nn.Module):
     _sp_plan = {
-        # Shard inputs to the first transformer block
-        "blocks.0": {
-            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3),
-        },
-        # If RoPE module outputs need sharding, use split_output=True
+        # Shard rope module OUTPUTS (returns tuple)
         "rope": {
             0: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),  # cos
             1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),  # sin
         },
-        # Gather outputs at the final projection
-        "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
-    }
-```
-
-**Example: Complex model requiring a preparation module (Qwen-Image / Z-Image)**
-
-For models where multiple tensors must be sharded **synchronously** (e.g., `hidden_states` and `vid_freqs` must match in sequence dimension), create a **preparation module** that outputs all tensors together:
-
-```python
-# Step 1: Create a preparation module
-class ImageRopePrepare(nn.Module):
-    """Encapsulates input projection and RoPE computation for _sp_plan sharding."""
-
-    def __init__(self, img_in: nn.Linear, pos_embed: nn.Module):
-        super().__init__()
-        self.img_in = img_in
-        self.pos_embed = pos_embed
-
-    def forward(self, hidden_states, img_shapes, txt_seq_lens):
-        hidden_states = self.img_in(hidden_states)
-        vid_freqs, txt_freqs = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
-        return hidden_states, vid_freqs, txt_freqs  # All outputs can be sharded together
-
-
-# Step 2: Define _sp_plan to shard the preparation module's outputs
-class QwenImageTransformer2DModel(nn.Module):
-    # Note: _sp_plan corresponds to diffusers' _cp_plan
-    _sp_plan = {
-        "image_rope_prepare": {
-            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),  # hidden_states
-            1: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True),  # vid_freqs
-            # txt_freqs (index 2) is NOT sharded - kept replicated for dual-stream attention
+        # Shard transformer block INPUT parameter
+        "blocks.0": {
+            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3),
         },
+        # Gather at final projection
         "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
-
-    def __init__(self, ...):
-        ...
-        # Create the preparation module
-        self.image_rope_prepare = ImageRopePrepare(self.img_in, self.pos_embed)
-
-    def forward(self, hidden_states, ...):
-        # Use the preparation module - _sp_plan will automatically shard its outputs
-        hidden_states, vid_freqs, txt_freqs = self.image_rope_prepare(
-            hidden_states, img_shapes, txt_seq_lens
-        )
-        image_rotary_emb = (vid_freqs, txt_freqs)
-        ...
-```
-
-**Step 3: The framework automatically applies SP**
-
-When the model is loaded with `sequence_parallel_size > 1`, the `registry.py` automatically:
-1. Detects the `_sp_plan` attribute
-2. Registers hooks to shard/gather tensors according to the plan
-3. Configures Attention layers for Ulysses/Ring communication
-
-```python
-from vllm_omni import Omni
-from vllm_omni.diffusion.data import DiffusionParallelConfig
-
-omni = Omni(
-    model="Qwen/Qwen-Image",
-    parallel_config=DiffusionParallelConfig(ulysses_degree=2)  # or ring_degree=2
-)
-
-outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50)
 ```
 
 ---
 
-###### Method 2: Intrusive modification (For highly complex cases)
+###### Hook flow
 
-For models with unusual architectures that cannot be expressed via `_sp_plan`, you can manually add sharding logic. This approach requires:
-
-- Manually chunk tensors at the beginning of `forward()`
-- Set appropriate forward context flags
-- Manually `all_gather` outputs at the end
-
-**Example: Manual sharding in forward()**
-
-```python
-from vllm_omni.diffusion.distributed.parallel_state import (
-    get_sequence_parallel_rank,
-    get_sequence_parallel_world_size,
-    get_sp_group,
-)
-from vllm_omni.diffusion.forward_context import get_forward_context
-
-class ComplexTransformer2DModel(nn.Module):
-    def forward(self, hidden_states, encoder_hidden_states, ...):
-        sp_size = self.parallel_config.sequence_parallel_size
-
-        if sp_size > 1:
-            sp_rank = get_sequence_parallel_rank()
-            sp_world_size = get_sequence_parallel_world_size()
-
-            # 1. Shard hidden_states along sequence dimension
-            hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
-
-            # 2. Set forward context for attention layers
-            # False = text embeddings are replicated (not sharded)
-            get_forward_context().split_text_embed_in_sp = False
-
-            # 3. Shard RoPE frequencies to match hidden_states
-            img_freqs, txt_freqs = self.pos_embed(...)
-            img_freqs = torch.chunk(img_freqs, sp_world_size, dim=0)[sp_rank]
-            # txt_freqs kept replicated for dual-stream attention
-            image_rotary_emb = (img_freqs, txt_freqs)
-
-        # ... transformer blocks ...
-
-        output = self.proj_out(hidden_states)
-
-        if sp_size > 1:
-            # 4. Gather outputs from all ranks
-            output = get_sp_group().all_gather(output, dim=1)
-
-        return output
+```
+Input → [SequenceParallelSplitHook: pre_forward] → Module.forward() → [post_forward] → ...
+                                                                              ↓
+... → [SequenceParallelGatherHook: post_forward] → Output
 ```
 
-**When to use intrusive modification:**
+1. **SplitHook** shards tensors before/after the target module
+2. **Attention layers** handle Ulysses/Ring communication internally
+3. **GatherHook** collects sharded outputs
 
-- The model has dynamic sharding logic (e.g., different sharding based on input content)
-- Multiple tensors need complex interdependent sharding that can't be expressed as module outputs
-- The model requires custom communication patterns beyond simple shard/gather
+The framework automatically applies these hooks when `sequence_parallel_size > 1`.
 
 ---
 
-###### Summary: Choosing the right approach
+###### Method 2: Intrusive modification (For complex cases)
 
-| Scenario | Recommended Approach |
-|----------|---------------------|
-| Standard transformer with RoPE module | `_sp_plan` with `split_output=True` on rope |
-| Dual-stream model (text + image) | Create preparation module + `_sp_plan` |
-| Model with complex dynamic sharding | Intrusive modification |
-| Rapid prototyping | Intrusive modification (then migrate to `_sp_plan`) |
+For models with dynamic sharding logic that cannot be expressed via `_sp_plan`:
+
+```python
+from vllm_omni.diffusion.distributed.sp_sharding import sp_shard, sp_gather
+
+def forward(self, hidden_states, ...):
+    if self.parallel_config.sequence_parallel_size > 1:
+        hidden_states = sp_shard(hidden_states, dim=1)
+        # ... computation ...
+        output = sp_gather(output, dim=1)
+    return output
+```
+
+---
+
+###### Choosing the right approach
+
+| Scenario | Approach |
+|----------|----------|
+| Standard transformer | `_sp_plan` |
+| Inline tensor ops need sharding | Extract to submodule + `_sp_plan` |
+| Dynamic/conditional sharding | Intrusive modification |
 
 
 ### CFG-Parallel
