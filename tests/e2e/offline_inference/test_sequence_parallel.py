@@ -54,15 +54,33 @@ def _diff_metrics(a: Image.Image, b: Image.Image) -> tuple[float, float]:
 
 
 def _cleanup_distributed():
-    """Clean up distributed environment."""
+    """Clean up distributed environment and GPU resources."""
+    import gc
+
     print("[DEBUG] Cleaning up distributed environment...")
+
+    # 1. Destroy process group
     if dist.is_initialized():
         print("[DEBUG] Destroying process group...")
         dist.destroy_process_group()
+
+    # 2. Clear environment variables
     for key in ["MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"]:
         os.environ.pop(key, None)
-    print("[DEBUG] Cleanup done, waiting 3 seconds...")
-    time.sleep(3)
+
+    # 3. Force garbage collection
+    print("[DEBUG] Running garbage collection...")
+    gc.collect()
+
+    # 4. Clear CUDA cache
+    if torch.cuda.is_available():
+        print("[DEBUG] Clearing CUDA cache...")
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    # 5. Wait for resources to fully release
+    print("[DEBUG] Cleanup done, waiting 5 seconds...")
+    time.sleep(5)
 
 
 def _run_baseline(model_name: str, dtype: torch.dtype, attn_backend: str, height: int, width: int, seed: int):
