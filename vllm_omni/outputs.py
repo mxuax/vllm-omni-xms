@@ -19,6 +19,9 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     """
 
     multimodal_outputs: dict[str, torch.Tensor] | None = None
+    # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
+    # The Scheduler can safely free the block tables for these requests.
+    kv_extracted_req_ids: list[str] | None = None
 
 
 @dataclass
@@ -54,6 +57,7 @@ class OmniRequestOutput:
     prompt: str | None = None
     latents: torch.Tensor | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
+    multimodal_output: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_pipeline(
@@ -88,6 +92,8 @@ class OmniRequestOutput:
         prompt: str | None = None,
         metrics: dict[str, Any] | None = None,
         latents: torch.Tensor | None = None,
+        multimodal_output: dict[str, Any] | None = None,
+        final_output_type: str = "image",
     ) -> "OmniRequestOutput":
         """Create output from diffusion model.
 
@@ -103,11 +109,12 @@ class OmniRequestOutput:
         """
         return cls(
             request_id=request_id,
-            final_output_type="image",
+            final_output_type=final_output_type,
             images=images,
             prompt=prompt,
             latents=latents,
             metrics=metrics or {},
+            multimodal_output=multimodal_output or {},
             finished=True,
         )
 
@@ -168,6 +175,7 @@ class OmniRequestOutput:
             f"prompt={self.prompt!r}",
             f"latents={self.latents}",
             f"metrics={self.metrics}",
+            f"multimodal_output={self.multimodal_output}",
         ]
 
         return f"OmniRequestOutput({', '.join(parts)})"

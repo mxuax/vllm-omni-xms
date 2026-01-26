@@ -23,6 +23,9 @@ from vllm_omni.distributed.omni_connectors import (
     initialize_orchestrator_connectors,
 )
 from vllm_omni.distributed.omni_connectors.adapter import try_send_via_connector
+from vllm_omni.distributed.omni_connectors.utils.initialization import (
+    resolve_omni_kv_config_for_stage,
+)
 from vllm_omni.distributed.ray_utils.utils import (
     create_placement_group,
     get_ray_queue_class,
@@ -34,6 +37,7 @@ from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
     get_final_stage_id_for_e2e,
+    inject_omni_kv_config,
     load_stage_configs_from_model,
     load_stage_configs_from_yaml,
     resolve_model_config_path,
@@ -277,6 +281,18 @@ class OmniBase:
                 stage_id,
             )
 
+            # Inject YAML-resolved connector config into omni_kv_config for
+            # in-engine usage (GPU model runner reads model_config.omni_kv_config).
+            try:
+                omni_conn_cfg, omni_from, omni_to = resolve_omni_kv_config_for_stage(
+                    self.omni_transfer_config, stage_id
+                )
+                if omni_conn_cfg:
+                    inject_omni_kv_config(stage, omni_conn_cfg, omni_from, omni_to)  # type: ignore
+
+            except Exception as e:
+                logger.debug("[Omni] Failed to inject omni connector config into stage-%s: %s", stage_id, e)
+
             stage.init_stage_worker(
                 model,
                 is_async=self.is_async,
@@ -329,6 +345,7 @@ class OmniBase:
         )
 
         suggestions = [
+            f"Ignore this warning if the model weight download / load from disk time is longer than {timeout}s.",
             "Verify GPU/device assignment in config (runtime.devices) is correct.",
             "Check GPU/host memory availability; reduce model or batch size if needed.",
             "Check model weights path and network reachability (if loading remotely).",
@@ -337,7 +354,7 @@ class OmniBase:
 
         formatted_suggestions = "\n".join(f"  {i + 1}) {msg}" for i, msg in enumerate(suggestions))
 
-        logger.error(f"[{self._name}] Stage initialization failed. Troubleshooting Steps:\n{formatted_suggestions}")
+        logger.warning(f"[{self._name}] Stage initialization timeout. Troubleshooting Steps:\n{formatted_suggestions}")
 
     def start_profile(self, stages: list[int] | None = None) -> None:
         """Start profiling for specified stages.
