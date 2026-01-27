@@ -6,7 +6,15 @@ import math
 
 import torch
 
-from .ring_globals import HAS_AITER, HAS_FLASH_ATTN, HAS_FLASH_ATTN_HOPPER, HAS_FLASHINFER, HAS_NPU
+from .ring_globals import (
+    HAS_AITER,
+    HAS_FLASH_ATTN,
+    HAS_FLASH_ATTN_HOPPER,
+    HAS_FLASHINFER,
+    HAS_NPU,
+    flash3_attn_func,
+    flash_attn_forward_hopper,
+)
 
 _scaled_dot_product_flash_attention = torch.ops.aten._scaled_dot_product_flash_attention
 _scaled_dot_product_efficient_attention = torch.ops.aten._scaled_dot_product_efficient_attention
@@ -25,15 +33,6 @@ if HAS_AITER:
 if HAS_FLASH_ATTN:
     import flash_attn
     from flash_attn.flash_attn_interface import _flash_attn_forward
-
-if HAS_FLASH_ATTN_HOPPER:
-    from flash_attn_interface import _flash_attn_backward as flash_attn_func_hopper_backward
-    from flash_attn_interface import _flash_attn_forward as flash_attn_forward_hopper
-    from flash_attn_interface import flash_attn_func as flash3_attn_func
-else:
-    flash_attn_forward_hopper = None
-    flash_attn_func_hopper_backward = None
-    flash3_attn_func = None
 
 if HAS_FLASHINFER:
     from flashinfer.prefill import single_prefill_with_kv_cache
@@ -149,47 +148,75 @@ def flash_attn_forward(
 def flash_attn3_func_forward(
     q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax
 ):
-    assert HAS_FLASH_ATTN_HOPPER
-    # current signature of flash_attn_forward_hopper:
-    # (q, k, v, softmax_scale, causal, window_size, descale_q=None, descale_k=None, descale_v=None, gqa_parallel=False)
+    assert HAS_FLASH_ATTN_HOPPER, "FA3 (Hopper) is not available"
 
-    out, softmax_lse, *unused = flash_attn_forward_hopper(
-        q=q,
-        k=k,
-        v=v,
-        k_new=None,
-        v_new=None,
-        qv=None,
-        out=None,
-        cu_seqlens_q=None,
-        cu_seqlens_k=None,
-        cu_seqlens_k_new=None,
-        seqused_q=None,
-        seqused_k=None,
-        max_seqlen_q=None,
-        max_seqlen_k=None,
-        page_table=None,
-        kv_batch_idx=None,
-        leftpad_k=None,
-        rotary_cos=None,
-        rotary_sin=None,
-        seqlens_rotary=None,
-        q_descale=None,
-        k_descale=None,
-        v_descale=None,
-        softmax_scale=softmax_scale,
-        causal=False,
-        window_size=(-1, -1),
-        attention_chunk=0,
-        softcap=0.0,
-        rotary_interleaved=True,
-        scheduler_metadata=None,
-        num_splits=0,
-        pack_gqa=None,
-        sm_margin=0,
-    )
+    # Use high-level flash3_attn_func if available (works with both flash_attn_interface and fa3_fwd_interface)
+    # The high-level API returns (out, lse) or just out depending on the package
+    if flash3_attn_func is not None:
+        result = flash3_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap if softcap else 0.0,
+            alibi_slopes=alibi_slopes,
+            return_attn_probs=return_softmax,
+        )
+        # Handle different return types: some packages return (out, lse), others just out
+        if isinstance(result, tuple):
+            out, softmax_lse = result[0], result[1] if len(result) > 1 else None
+        else:
+            out = result
+            softmax_lse = None
+        # If softmax_lse is None, compute a dummy one (needed for ring attention accumulation)
+        if softmax_lse is None:
+            # Create a dummy LSE tensor with the right shape: (batch, heads, seq_len)
+            softmax_lse = torch.zeros(q.shape[0], q.shape[2], q.shape[1], dtype=torch.float32, device=q.device)
+        return out, softmax_lse
 
-    return out, softmax_lse
+    # Fallback: use low-level flash_attn_forward_hopper if available
+    if flash_attn_forward_hopper is not None:
+        out, softmax_lse, *unused = flash_attn_forward_hopper(
+            q=q,
+            k=k,
+            v=v,
+            k_new=None,
+            v_new=None,
+            qv=None,
+            out=None,
+            cu_seqlens_q=None,
+            cu_seqlens_k=None,
+            cu_seqlens_k_new=None,
+            seqused_q=None,
+            seqused_k=None,
+            max_seqlen_q=None,
+            max_seqlen_k=None,
+            page_table=None,
+            kv_batch_idx=None,
+            leftpad_k=None,
+            rotary_cos=None,
+            rotary_sin=None,
+            seqlens_rotary=None,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            attention_chunk=0,
+            softcap=softcap if softcap else 0.0,
+            rotary_interleaved=True,
+            scheduler_metadata=None,
+            num_splits=0,
+            pack_gqa=None,
+            sm_margin=0,
+        )
+        return out, softmax_lse
+
+    raise RuntimeError("FA3 is marked as available but no implementation found")
 
 
 def flash_attn_forward_aiter(
