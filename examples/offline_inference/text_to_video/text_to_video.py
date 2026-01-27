@@ -19,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate a video with Wan2.2 T2V.")
     parser.add_argument(
         "--model",
-        default="Wan-AI/h.2-T2V-A14B-Diffusers",
+        default="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
         help="Diffusers Wan2.2 model ID or local path.",
     )
     parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
