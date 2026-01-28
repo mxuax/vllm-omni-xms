@@ -7,14 +7,12 @@ import math
 import torch
 
 from .ring_globals import (
-    FA3_RETURNS_LSE,
     HAS_AITER,
     HAS_FA3,
     HAS_FLASH_ATTN,
     HAS_FLASHINFER,
     HAS_NPU,
     fa3_attn_func,
-    fa3_fwd_func,
 )
 
 _scaled_dot_product_flash_attention = torch.ops.aten._scaled_dot_product_flash_attention
@@ -150,73 +148,23 @@ def fa3_forward(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap,
     """FA3 forward pass for inference.
 
     FA3 supports Ampere, Ada, and Hopper GPUs. Dropout is ignored since FA3 is inference-only.
-    LSE availability is detected at module import time (see ring_globals.FA3_RETURNS_LSE).
+    FA3 high-level API always returns (out, softmax_lse) tuple.
     """
     assert HAS_FA3, "FA3 is not available"
+    assert fa3_attn_func is not None, "FA3 high-level API (fa3_attn_func) not available"
 
-    # Use high-level API if it returns LSE (detected at import time)
-    # IMPORTANT: Ring attention's update_out_and_lse requires true LSE values for correct
-    # accumulation across ring steps.
-    if fa3_attn_func is not None and FA3_RETURNS_LSE:
-        # FA3 is inference-only, so we don't pass dropout_p (always 0 for inference)
-        result = fa3_attn_func(
-            q,
-            k,
-            v,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            softcap=softcap if softcap else 0.0,
-        )
-
-        # Extract output and LSE from result
-        if isinstance(result, tuple) and len(result) > 1:
-            out, softmax_lse = result[0], result[1]
-            return out, softmax_lse
-        # If unexpectedly not a tuple, fall through to low-level API
-
-    # Use low-level API which reliably returns LSE
-    # Note: fa3_fwd uses different parameter names than flash_attn_interface
-    if fa3_fwd_func is not None:
-        out, softmax_lse, *unused = fa3_fwd_func(
-            q=q,
-            k=k,
-            v=v,
-            k_new=None,
-            v_new=None,
-            qv=None,
-            out_=None,  # fa3_fwd uses out_, not out
-            cu_seqlens_q=None,
-            cu_seqlens_k=None,
-            cu_seqlens_k_new=None,
-            seqused_q=None,
-            seqused_k=None,
-            max_seqlen_q=None,
-            max_seqlen_k=None,
-            page_table=None,
-            kv_batch_idx=None,
-            leftpad_k=None,
-            rotary_cos=None,
-            rotary_sin=None,
-            seqlens_rotary=None,
-            q_descale=None,
-            k_descale=None,
-            v_descale=None,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size_left=window_size[0] if window_size else -1,
-            window_size_right=window_size[1] if window_size else -1,
-            attention_chunk=0,
-            softcap=softcap if softcap else 0.0,
-            rotary_interleaved=True,
-            scheduler_metadata=None,
-            num_splits=1,
-            pack_gqa=None,
-            sm_margin=0,
-        )
-        return out, softmax_lse
-
-    raise RuntimeError("FA3 is marked as available but no implementation found")
+    # FA3 high-level API always returns (out, softmax_lse)
+    # FA3 is inference-only, so we don't pass dropout_p (always 0 for inference)
+    out, softmax_lse = fa3_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap if softcap else 0.0,
+    )
+    return out, softmax_lse
 
 
 # Legacy alias for backward compatibility

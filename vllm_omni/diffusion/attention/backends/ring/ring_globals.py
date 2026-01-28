@@ -3,8 +3,6 @@
 # Copyright (c) 2024, Jiarui Fang.
 # Adapted from https://github.com/feifeibear/long-context-attention
 
-import torch
-
 # test if flash_attn (FA2) is available
 try:
     import flash_attn  # noqa: F401
@@ -17,11 +15,10 @@ except (ImportError, ModuleNotFoundError):
 # FA3 detection: try multiple sources (forward only, no backward needed for inference)
 # Source 1: flash_attn_interface (from flash-attention source build)
 # Source 2: fa3_fwd_interface (from fa3-fwd PyPI package, supports Ampere/Ada/Hopper)
+# Note: FA3 high-level API (flash_attn_func) always returns (out, softmax_lse) tuple
 HAS_FA3 = False
-fa3_fwd_func = None  # Low-level forward function
-fa3_attn_func = None  # High-level attention function
-FA3_RETURNS_LSE = False  # Whether the high-level API returns LSE (detected at import time)
-_FA3_SOURCE = None  # Source of FA3 ("flash_attn_interface" or "fa3_fwd_interface")
+fa3_fwd_func = None  # Low-level forward function (_flash_attn_forward)
+fa3_attn_func = None  # High-level attention function (flash_attn_func)
 
 # Try flash_attn_interface first (from flash-attention source build)
 try:
@@ -29,7 +26,6 @@ try:
     from flash_attn_interface import flash_attn_func as fa3_attn_func  # noqa: F401
 
     HAS_FA3 = True
-    _FA3_SOURCE = "flash_attn_interface"
 except (ImportError, ModuleNotFoundError):
     pass
 
@@ -40,27 +36,8 @@ if not HAS_FA3:
         from fa3_fwd_interface import flash_attn_func as fa3_attn_func  # noqa: F401
 
         HAS_FA3 = True
-        _FA3_SOURCE = "fa3_fwd_interface"
     except (ImportError, ModuleNotFoundError):
         pass
-
-# Detect at import time whether fa3_attn_func returns LSE
-# This avoids runtime detection overhead in the forward pass
-if HAS_FA3 and fa3_attn_func is not None:
-    try:
-        # Create small test tensors to probe the API
-        _test_q = torch.zeros(1, 1, 1, 64, device="meta")
-        _test_k = torch.zeros(1, 1, 1, 64, device="meta")
-        _test_v = torch.zeros(1, 1, 1, 64, device="meta")
-        # We can't actually run on meta device, so we check function signature instead
-        import inspect
-
-        sig = inspect.signature(fa3_attn_func)
-        # If the function has return_lse or similar parameter, it likely returns LSE
-        # Otherwise, we assume it returns (out, lse) tuple by default for FA3
-        FA3_RETURNS_LSE = True  # FA3 high-level API typically returns LSE
-    except Exception:
-        FA3_RETURNS_LSE = False
 
 # Legacy aliases for backward compatibility
 HAS_FLASH_ATTN_HOPPER = HAS_FA3
