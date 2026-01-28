@@ -24,7 +24,7 @@ try:
     from fa3_fwd_interface import flash_attn_func, flash_attn_varlen_func
 
     _FA_BACKEND = "fa3_fwd"
-except ImportError:
+except (ImportError, ModuleNotFoundError):
     pass
 
 # Fallback: Try FA3 from flash-attention source build (Hopper)
@@ -33,7 +33,7 @@ if _FA_BACKEND is None:
         from flash_attn_interface import flash_attn_func, flash_attn_varlen_func
 
         _FA_BACKEND = "flash_attn_interface"
-    except ImportError:
+    except (ImportError, ModuleNotFoundError):
         pass
 
 # Fallback: Try FA2 from flash-attn package
@@ -42,7 +42,7 @@ if _FA_BACKEND is None:
         from flash_attn import flash_attn_func, flash_attn_varlen_func
 
         _FA_BACKEND = "flash_attn"
-    except ImportError:
+    except (ImportError, ModuleNotFoundError):
         pass
 
 if _FA_BACKEND is None:
