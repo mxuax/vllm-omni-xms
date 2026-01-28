@@ -15,6 +15,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.selector import get_attn_backend
+from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.forward_context import get_forward_context
 
 logger = init_logger(__name__)
@@ -52,13 +53,26 @@ class Attention(nn.Module):
         self.use_sync = use_sync
         self.causal = causal
 
+        self.use_ring = False
+        self.ring_pg = None
+        self.ring_runner = None
+
         try:
             config = get_forward_context().omni_diffusion_config
             self.backend_pref = config.attention_backend
+            if config.parallel_config.ring_degree > 1:
+                self.use_ring = True
+                try:
+                    sp_group = get_sp_group()
+                    self.ring_pg = sp_group.ring_group
+                    self.ring_runner = RingParallelAttention(sp_group)
+                except Exception:
+                    self.use_ring = False
+                    self.ring_runner = None
         except Exception:
-            pass
+            self.use_ring = False
+            self.ring_runner = None
 
-        # Build parallel strategy (handles Ulysses, Ring, or NoParallel)
         self.parallel_strategy = build_parallel_attention_strategy(
             scatter_idx=scatter_idx,
             gather_idx=gather_idx,
@@ -78,18 +92,13 @@ class Attention(nn.Module):
         query, key, value, attn_metadata, ctx = self.parallel_strategy.pre_attention(query, key, value, attn_metadata)
 
         # 2. Kernel Execution (Computation)
-        # Ring attention uses its own kernel with P2P communication
-        # Ulysses and NoParallel use local attention kernel
-        if isinstance(self.parallel_strategy, RingParallelAttention):
-            out = self.parallel_strategy.run_attention(
-                query, key, value, attn_metadata, softmax_scale=self.softmax_scale, causal=self.causal
-            )
+        if self.use_ring:
+            out = self._run_ring_attention(query, key, value, attn_metadata)
         else:
             out = self._run_local_attention(query, key, value, attn_metadata)
 
         # 3. Post-processing (Reverse Communication)
         # For Ulysses: AllToAll Output, and AllGather Joint Output
-        # For Ring/NoParallel: no-op
         out = self.parallel_strategy.post_attention(out, ctx)
 
         return out
@@ -104,3 +113,12 @@ class Attention(nn.Module):
 
         # Fallback to standard attention
         return self.attention.forward(query, key, value, attn_metadata)
+
+    def _run_ring_attention(self, query, key, value, attn_metadata):
+        # Delegate to RingParallelAttention strategy if available
+        if self.ring_runner is not None:
+            return self.ring_runner.run_attention(
+                query, key, value, attn_metadata, softmax_scale=self.softmax_scale, causal=self.causal
+            )
+
+        raise RuntimeError("Ring attention is enabled but strategy is not RingParallelAttention")
