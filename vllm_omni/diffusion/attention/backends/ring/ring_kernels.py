@@ -182,6 +182,7 @@ def flash_attn3_func_forward(
             _flash3_returns_lse = False  # Cache: don't try high-level API again
 
     # Use low-level API which reliably returns LSE
+    # Note: fa3_fwd uses different parameter names than flash_attn_interface
     if flash_attn_forward_hopper is not None:
         out, softmax_lse, *unused = flash_attn_forward_hopper(
             q=q,
@@ -190,7 +191,7 @@ def flash_attn3_func_forward(
             k_new=None,
             v_new=None,
             qv=None,
-            out=None,
+            out_=None,  # fa3_fwd uses out_, not out
             cu_seqlens_q=None,
             cu_seqlens_k=None,
             cu_seqlens_k_new=None,
@@ -209,12 +210,13 @@ def flash_attn3_func_forward(
             v_descale=None,
             softmax_scale=softmax_scale,
             causal=causal,
-            window_size=window_size,
+            window_size_left=window_size[0] if window_size else -1,
+            window_size_right=window_size[1] if window_size else -1,
             attention_chunk=0,
             softcap=softcap if softcap else 0.0,
             rotary_interleaved=True,
             scheduler_metadata=None,
-            num_splits=0,
+            num_splits=1,
             pack_gqa=None,
             sm_margin=0,
         )
