@@ -134,11 +134,14 @@ class FlashAttentionImpl(AttentionImpl):
             out = _pad_input(out_unpad, indices_q, query.size(0), query_length)
 
         else:
-            out: torch.Tensor = flash_attn_func(
+            out = flash_attn_func(
                 query,
                 key,
                 value,
                 causal=self.causal,
                 softmax_scale=self.softmax_scale,
             )
+            # FA3 may return (out, lse) tuple, FA2 returns just out
+            if isinstance(out, tuple):
+                out = out[0]
         return out

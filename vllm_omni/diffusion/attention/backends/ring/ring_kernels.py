@@ -145,13 +145,14 @@ def flash_attn_forward(
     return block_out, block_lse
 
 
-# Cache to track whether flash3_attn_func returns LSE
+# Cache to track whether flash3_attn_func returns LSE (None = unknown, True/False = tested)
 _flash3_returns_lse: bool | None = None
 
 
 def flash_attn3_func_forward(
     q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax
 ):
+    """FA3 forward pass for inference (dropout is ignored since FA3 is inference-only)."""
     global _flash3_returns_lse
     assert HAS_FLASH_ATTN_HOPPER, "FA3 (Hopper) is not available"
 
@@ -159,18 +160,17 @@ def flash_attn3_func_forward(
     # IMPORTANT: Ring attention's update_out_and_lse requires true LSE values for correct
     # accumulation across ring steps. We must verify the API returns LSE before using it.
     if flash3_attn_func is not None and _flash3_returns_lse is not False:
+        # FA3 is inference-only, so we don't pass dropout_p (always 0 for inference)
         result = flash3_attn_func(
             q,
             k,
             v,
-            dropout_p=dropout_p,
             softmax_scale=softmax_scale,
             causal=causal,
             window_size=window_size,
             softcap=softcap if softcap else 0.0,
-            alibi_slopes=alibi_slopes,
-            return_attn_probs=return_softmax,
         )
+
         # Check if result contains valid LSE
         if isinstance(result, tuple) and len(result) > 1 and result[1] is not None:
             if _flash3_returns_lse is None:
