@@ -7,13 +7,14 @@ import math
 import torch
 
 from .ring_globals import (
+    FA3_RETURNS_LSE,
     HAS_AITER,
+    HAS_FA3,
     HAS_FLASH_ATTN,
-    HAS_FLASH_ATTN_HOPPER,
     HAS_FLASHINFER,
     HAS_NPU,
-    flash3_attn_func,
-    flash_attn_forward_hopper,
+    fa3_attn_func,
+    fa3_fwd_func,
 )
 
 _scaled_dot_product_flash_attention = torch.ops.aten._scaled_dot_product_flash_attention
@@ -145,23 +146,20 @@ def flash_attn_forward(
     return block_out, block_lse
 
 
-# Cache to track whether flash3_attn_func returns LSE (None = unknown, True/False = tested)
-_flash3_returns_lse: bool | None = None
+def fa3_forward(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax):
+    """FA3 forward pass for inference.
 
+    FA3 supports Ampere, Ada, and Hopper GPUs. Dropout is ignored since FA3 is inference-only.
+    LSE availability is detected at module import time (see ring_globals.FA3_RETURNS_LSE).
+    """
+    assert HAS_FA3, "FA3 is not available"
 
-def flash_attn3_func_forward(
-    q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax
-):
-    """FA3 forward pass for inference (dropout is ignored since FA3 is inference-only)."""
-    global _flash3_returns_lse
-    assert HAS_FLASH_ATTN_HOPPER, "FA3 (Hopper) is not available"
-
-    # Try high-level flash3_attn_func if available and known to return LSE
+    # Use high-level API if it returns LSE (detected at import time)
     # IMPORTANT: Ring attention's update_out_and_lse requires true LSE values for correct
-    # accumulation across ring steps. We must verify the API returns LSE before using it.
-    if flash3_attn_func is not None and _flash3_returns_lse is not False:
+    # accumulation across ring steps.
+    if fa3_attn_func is not None and FA3_RETURNS_LSE:
         # FA3 is inference-only, so we don't pass dropout_p (always 0 for inference)
-        result = flash3_attn_func(
+        result = fa3_attn_func(
             q,
             k,
             v,
@@ -171,20 +169,16 @@ def flash_attn3_func_forward(
             softcap=softcap if softcap else 0.0,
         )
 
-        # Check if result contains valid LSE
-        if isinstance(result, tuple) and len(result) > 1 and result[1] is not None:
-            if _flash3_returns_lse is None:
-                _flash3_returns_lse = True  # Cache: high-level API works
+        # Extract output and LSE from result
+        if isinstance(result, tuple) and len(result) > 1:
             out, softmax_lse = result[0], result[1]
             return out, softmax_lse
-        else:
-            # High-level API doesn't return LSE, mark it and fall through to low-level API
-            _flash3_returns_lse = False  # Cache: don't try high-level API again
+        # If unexpectedly not a tuple, fall through to low-level API
 
     # Use low-level API which reliably returns LSE
     # Note: fa3_fwd uses different parameter names than flash_attn_interface
-    if flash_attn_forward_hopper is not None:
-        out, softmax_lse, *unused = flash_attn_forward_hopper(
+    if fa3_fwd_func is not None:
+        out, softmax_lse, *unused = fa3_fwd_func(
             q=q,
             k=k,
             v=v,
@@ -223,6 +217,10 @@ def flash_attn3_func_forward(
         return out, softmax_lse
 
     raise RuntimeError("FA3 is marked as available but no implementation found")
+
+
+# Legacy alias for backward compatibility
+flash_attn3_func_forward = fa3_forward
 
 
 def flash_attn_forward_aiter(

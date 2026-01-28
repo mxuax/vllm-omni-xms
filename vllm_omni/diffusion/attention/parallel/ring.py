@@ -10,7 +10,7 @@ import torch
 from vllm.logger import init_logger
 
 # import torch.distributed as dist # Not used directly here, but good practice if needed
-from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_FLASH_ATTN, HAS_FLASH_ATTN_HOPPER
+from vllm_omni.diffusion.attention.backends.ring.ring_globals import HAS_FA3, HAS_FLASH_ATTN
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType
 from vllm_omni.diffusion.attention.parallel.base import (
     ParallelAttentionContext,
@@ -120,7 +120,7 @@ class RingParallelAttention:
         # FP32 is not supported by Flash Attention, force SDPA
         if query.dtype == torch.float32:
             backend_pref = "sdpa"
-        elif not HAS_FLASH_ATTN_HOPPER and not HAS_FLASH_ATTN:
+        elif not HAS_FA3 and not HAS_FLASH_ATTN:
             if backend_pref != "sdpa":
                 logger = init_logger(__name__)
                 logger.warning_once("Flash Attention (FA2/FA3) is not available! Force enabling SDPA.")
@@ -153,8 +153,8 @@ class RingParallelAttention:
 
         from vllm_omni.diffusion.attention.backends.ring_flash_attn import ring_flash_attn_func
 
-        # Prefer FA3 (Hopper) over FA2 for better performance on H100
-        attn_type = AttnType.FA3 if HAS_FLASH_ATTN_HOPPER else AttnType.FA
+        # Prefer FA3 over FA2 for better performance (FA3 supports Ampere/Ada/Hopper)
+        attn_type = AttnType.FA3 if HAS_FA3 else AttnType.FA
 
         return ring_flash_attn_func(
             query,
