@@ -145,7 +145,7 @@ def flash_attn_forward(
     return block_out, block_lse
 
 
-# Cache to track whether flash3_attn_func returns LSE (checked once, reused forever)
+# Cache to track whether flash3_attn_func returns LSE
 _flash3_returns_lse: bool | None = None
 
 
@@ -298,33 +298,35 @@ def flashinfer_attn_forward(
 
 
 def npu_attn_forward(
-    q,
-    k,
-    v,
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    window_size=(-1, -1),
-    softcap=None,
-    alibi_slopes=None,
-    return_softmax=False,
-    layout="BSND",
-):
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float = 0.0,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    window_size: tuple[int, int] = (-1, -1),
+    softcap: float | None = None,
+    alibi_slopes: torch.Tensor | None = None,
+    return_softmax: bool = False,
+    layout: str = "BSND",
+) -> tuple[torch.Tensor, torch.Tensor]:
     """NPU attention forward compatible with ring attention interface.
 
     Args:
-        q, k, v: Query, Key, Value tensors
-        dropout_p: Dropout probability (ignored on NPU)
-        softmax_scale: Softmax scale factor
-        causal: Causal attention flag (ignored on NPU, handled via pre_tokens/next_tokens)
-        window_size: Window size (ignored on NPU)
-        softcap: Soft cap value (ignored on NPU)
-        alibi_slopes: ALiBi slopes (ignored on NPU)
-        return_softmax: Return softmax flag (ignored on NPU)
-        layout: Input layout, default "BSND"
+        q: Query tensor of shape (batch, seq_len, num_heads, head_dim).
+        k: Key tensor of shape (batch, seq_len, num_heads, head_dim).
+        v: Value tensor of shape (batch, seq_len, num_heads, head_dim).
+        dropout_p: Dropout probability (ignored on NPU).
+        softmax_scale: Softmax scale factor.
+        causal: Causal attention flag (ignored on NPU, handled via pre_tokens/next_tokens).
+        window_size: Window size (ignored on NPU).
+        softcap: Soft cap value (ignored on NPU).
+        alibi_slopes: ALiBi slopes (ignored on NPU).
+        return_softmax: Return softmax flag (ignored on NPU).
+        layout: Input layout, default "BSND".
 
     Returns:
-        tuple: (output, lse)
+        tuple[torch.Tensor, torch.Tensor]: (output, lse).
     """
     assert HAS_NPU, "torch_npu is not available"
     if softmax_scale is None:
