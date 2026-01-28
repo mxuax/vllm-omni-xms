@@ -9,13 +9,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.backends.utils.fa import (
-    _pad_input,
-    _unpad_input,
-    _upad_input,
-    flash_attn_func,
-    flash_attn_varlen_func,
-)
+from vllm_omni.diffusion.attention.backends.utils.fa import _pad_input, _unpad_input, _upad_input
 
 logger = init_logger(__name__)
 
