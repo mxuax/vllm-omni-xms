@@ -145,14 +145,20 @@ def flash_attn_forward(
     return block_out, block_lse
 
 
+# Cache to track whether flash3_attn_func returns LSE (checked once, reused forever)
+_flash3_returns_lse: bool | None = None
+
+
 def flash_attn3_func_forward(
     q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax
 ):
+    global _flash3_returns_lse
     assert HAS_FLASH_ATTN_HOPPER, "FA3 (Hopper) is not available"
 
-    # Use high-level flash3_attn_func if available (works with both flash_attn_interface and fa3_fwd_interface)
-    # The high-level API returns (out, lse) or just out depending on the package
-    if flash3_attn_func is not None:
+    # Try high-level flash3_attn_func if available and known to return LSE
+    # IMPORTANT: Ring attention's update_out_and_lse requires true LSE values for correct
+    # accumulation across ring steps. We must verify the API returns LSE before using it.
+    if flash3_attn_func is not None and _flash3_returns_lse is not False:
         result = flash3_attn_func(
             q,
             k,
@@ -165,19 +171,17 @@ def flash_attn3_func_forward(
             alibi_slopes=alibi_slopes,
             return_attn_probs=return_softmax,
         )
-        # Handle different return types: some packages return (out, lse), others just out
-        if isinstance(result, tuple):
-            out, softmax_lse = result[0], result[1] if len(result) > 1 else None
+        # Check if result contains valid LSE
+        if isinstance(result, tuple) and len(result) > 1 and result[1] is not None:
+            if _flash3_returns_lse is None:
+                _flash3_returns_lse = True  # Cache: high-level API works
+            out, softmax_lse = result[0], result[1]
+            return out, softmax_lse
         else:
-            out = result
-            softmax_lse = None
-        # If softmax_lse is None, compute a dummy one (needed for ring attention accumulation)
-        if softmax_lse is None:
-            # Create a dummy LSE tensor with the right shape: (batch, heads, seq_len)
-            softmax_lse = torch.zeros(q.shape[0], q.shape[2], q.shape[1], dtype=torch.float32, device=q.device)
-        return out, softmax_lse
+            # High-level API doesn't return LSE, mark it and fall through to low-level API
+            _flash3_returns_lse = False  # Cache: don't try high-level API again
 
-    # Fallback: use low-level flash_attn_forward_hopper if available
+    # Use low-level API which reliably returns LSE
     if flash_attn_forward_hopper is not None:
         out, softmax_lse, *unused = flash_attn_forward_hopper(
             q=q,
@@ -293,9 +297,38 @@ def flashinfer_attn_forward(
     return out, lse
 
 
-def npu_attn_forward(q, k, v, softmax_scale=None, layout="BSND"):
+def npu_attn_forward(
+    q,
+    k,
+    v,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=None,
+    alibi_slopes=None,
+    return_softmax=False,
+    layout="BSND",
+):
+    """NPU attention forward compatible with ring attention interface.
+
+    Args:
+        q, k, v: Query, Key, Value tensors
+        dropout_p: Dropout probability (ignored on NPU)
+        softmax_scale: Softmax scale factor
+        causal: Causal attention flag (ignored on NPU, handled via pre_tokens/next_tokens)
+        window_size: Window size (ignored on NPU)
+        softcap: Soft cap value (ignored on NPU)
+        alibi_slopes: ALiBi slopes (ignored on NPU)
+        return_softmax: Return softmax flag (ignored on NPU)
+        layout: Input layout, default "BSND"
+
+    Returns:
+        tuple: (output, lse)
+    """
     assert HAS_NPU, "torch_npu is not available"
-    softmax_scale = q.shape[-1] ** (-0.5)
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
     block_out, block_lse = torch_npu.npu_fused_infer_attention_score(
         q,
         k,
