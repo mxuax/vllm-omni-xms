@@ -45,19 +45,33 @@ else:
         except (ImportError, ModuleNotFoundError):
             pass
 
-    # Fallback: Try FA2 from flash-attn package
+    # Fallback: Try FA2 from flash-attn package (try multiple import paths)
     if flash_attn_func is None:
         try:
             from flash_attn import flash_attn_func, flash_attn_varlen_func  # noqa: F401
         except (ImportError, ModuleNotFoundError):
             pass
 
-if flash_attn_func is None:
-    raise ImportError(
-        "No Flash Attention backend available. Please install one of: "
-        "fa3-fwd (pip install fa3-fwd), "
-        "flash-attention Hopper (build from source), or "
-        "flash-attn (pip install flash-attn)"
+    if flash_attn_func is None:
+        try:
+            from flash_attn.flash_attn_interface import (  # noqa: F401
+                flash_attn_func,
+                flash_attn_varlen_func,
+            )
+        except (ImportError, ModuleNotFoundError):
+            pass
+
+# If no FA backend available, we'll use SDPA fallback in the attention implementation
+# flash_attn_func and flash_attn_varlen_func will be None
+HAS_FLASH_ATTN = flash_attn_func is not None
+
+if not HAS_FLASH_ATTN:
+    import warnings
+
+    warnings.warn(
+        "No Flash Attention backend available. Will use PyTorch SDPA as fallback. "
+        "For better performance, install one of: fa3-fwd, flash-attention, or flash-attn",
+        stacklevel=2,
     )
 
 
