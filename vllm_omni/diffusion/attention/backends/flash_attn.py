@@ -9,51 +9,18 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.backends.utils.fa import _pad_input, _unpad_input, _upad_input
+
+# Import flash attention functions with fallback chain from utils/fa.py
+# FA3 (fa3_fwd_interface) -> FA3 (flash_attn_interface) -> FA2 (flash_attn)
+from vllm_omni.diffusion.attention.backends.utils.fa import (
+    _pad_input,
+    _unpad_input,
+    _upad_input,
+    flash_attn_func,
+    flash_attn_varlen_func,
+)
 
 logger = init_logger(__name__)
-
-# Flash Attention backend detection with fallback chain:
-# FA3 (fa3_fwd_interface) -> FA3 (flash_attn_interface) -> FA2 (flash_attn)
-flash_attn_func = None
-flash_attn_varlen_func = None
-_FA_BACKEND = None
-
-# Try FA3 from fa3-fwd PyPI package
-try:
-    from fa3_fwd_interface import flash_attn_func, flash_attn_varlen_func
-
-    _FA_BACKEND = "fa3_fwd"
-except (ImportError, ModuleNotFoundError):
-    pass
-
-# Fallback: Try FA3 from flash-attention source build (Hopper)
-if _FA_BACKEND is None:
-    try:
-        from flash_attn_interface import flash_attn_func, flash_attn_varlen_func
-
-        _FA_BACKEND = "flash_attn_interface"
-    except (ImportError, ModuleNotFoundError):
-        pass
-
-# Fallback: Try FA2 from flash-attn package
-if _FA_BACKEND is None:
-    try:
-        from flash_attn import flash_attn_func, flash_attn_varlen_func
-
-        _FA_BACKEND = "flash_attn"
-    except (ImportError, ModuleNotFoundError):
-        pass
-
-if _FA_BACKEND is None:
-    raise ImportError(
-        "No Flash Attention backend available. Please install one of: "
-        "fa3-fwd (pip install fa3-fwd), "
-        "flash-attention Hopper (build from source), or "
-        "flash-attn (pip install flash-attn)"
-    )
-
-logger.info(f"Using Flash Attention backend: {_FA_BACKEND}")
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -99,14 +66,6 @@ class FlashAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
         """CUDA/ROCm flash attention implementation."""
-        from vllm_omni.diffusion.attention.backends.utils.fa import (
-            _pad_input,
-            _unpad_input,
-            _upad_input,
-            flash_attn_func,
-            flash_attn_varlen_func,
-        )
-
         query_length = query.size(1)
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         #  Contains at least one padding token in the sequence
