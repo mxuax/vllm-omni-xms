@@ -51,7 +51,8 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
             compute_supported = 80 <= capability < 100
 
         # Check if FA packages are available
-        packages_available = PACKAGES_CHECKER.has_flash_attn()
+        packages_info = PACKAGES_CHECKER.get_packages_info()
+        packages_available = packages_info.get("has_flash_attn", False)
 
         # Both compute capability and packages must be available for FA
         flash_attn_supported = compute_supported and packages_available
