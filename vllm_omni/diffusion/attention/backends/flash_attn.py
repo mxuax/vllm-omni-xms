@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
-import torch.nn.functional as F
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -12,7 +11,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 
 # Import flash attention functions with fallback chain from utils/fa.py
-# FA3 (fa3_fwd_interface) -> FA3 (flash_attn_interface) -> FA2 (flash_attn) -> SDPA fallback
+# FA3 (fa3_fwd_interface) -> FA3 (flash_attn_interface) -> FA2 (flash_attn)
 from vllm_omni.diffusion.attention.backends.utils.fa import (
     HAS_FLASH_ATTN,
     _pad_input,
@@ -23,6 +22,13 @@ from vllm_omni.diffusion.attention.backends.utils.fa import (
 )
 
 logger = init_logger(__name__)
+
+if not HAS_FLASH_ATTN:
+    raise ImportError(
+        "FlashAttentionBackend requires Flash Attention. "
+        "Please install one of: fa3-fwd, flash-attention, or flash-attn. "
+        "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
+    )
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -67,11 +73,7 @@ class FlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
-        """CUDA/ROCm flash attention implementation with SDPA fallback."""
-        # Use SDPA fallback if no FA backend available
-        if not HAS_FLASH_ATTN:
-            return self._forward_sdpa(query, key, value, attn_metadata)
-
+        """CUDA/ROCm flash attention implementation."""
         query_length = query.size(1)
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         #  Contains at least one padding token in the sequence
@@ -110,46 +112,6 @@ class FlashAttentionImpl(AttentionImpl):
             # FA3 may return (out, lse) tuple, FA2 returns just out
             if isinstance(out, tuple):
                 out = out[0]
-        return out
-
-    def _forward_sdpa(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_metadata: AttentionMetadata = None,
-    ) -> torch.Tensor:
-        """PyTorch SDPA fallback when no FA backend is available.
-
-        Input shape: (batch, seq_len, num_heads, head_dim)
-        SDPA expects: (batch, num_heads, seq_len, head_dim)
-        """
-        # Transpose to SDPA expected format
-        q = query.transpose(1, 2)  # (B, H, S, D)
-        k = key.transpose(1, 2)
-        v = value.transpose(1, 2)
-
-        # Handle attention mask if present
-        attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
-        attn_mask = None
-        if attention_mask is not None:
-            # Convert boolean mask to attention mask format
-            # attention_mask: (B, S) where True = valid, False = masked
-            # SDPA expects: (B, 1, 1, S) or (B, 1, S, S) where -inf = masked
-            attn_mask = attention_mask[:, None, None, :].float()
-            attn_mask = attn_mask.masked_fill(~attention_mask[:, None, None, :], float("-inf"))
-
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            is_causal=self.causal if attn_mask is None else False,
-            scale=self.softmax_scale,
-        )
-
-        # Transpose back to original format
-        out = out.transpose(1, 2)  # (B, S, H, D)
         return out
 
     def forward_npu(

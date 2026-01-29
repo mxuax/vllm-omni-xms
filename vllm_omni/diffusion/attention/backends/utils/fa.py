@@ -61,18 +61,9 @@ else:
         except (ImportError, ModuleNotFoundError):
             pass
 
-# If no FA backend available, we'll use SDPA fallback in the attention implementation
+# If no FA backend available, SDPA backend will be selected at the platform level
 # flash_attn_func and flash_attn_varlen_func will be None
 HAS_FLASH_ATTN = flash_attn_func is not None
-
-if not HAS_FLASH_ATTN:
-    import warnings
-
-    warnings.warn(
-        "No Flash Attention backend available. Will use PyTorch SDPA as fallback. "
-        "For better performance, install one of: fa3-fwd, flash-attention, or flash-attn",
-        stacklevel=2,
-    )
 
 
 def _index_first_axis(tensor, indices):
