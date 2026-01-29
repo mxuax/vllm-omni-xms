@@ -11,7 +11,6 @@ from .ring_globals import (
     HAS_FA3,
     HAS_FLASH_ATTN,
     HAS_FLASHINFER,
-    HAS_NPU,
     fa3_attn_func,
 )
 
@@ -37,9 +36,6 @@ if HAS_FLASHINFER:
     from flashinfer.prefill import single_prefill_with_kv_cache
 
     _LOG2_E = math.log2(math.e)
-
-if HAS_NPU:
-    import torch_npu
 
 
 def pytorch_attn_forward(
@@ -243,51 +239,3 @@ def flashinfer_attn_forward(
         raise ValueError(f"Invalid input shape: {q.shape}")
     lse = lse / _LOG2_E
     return out, lse
-
-
-def npu_attn_forward(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    dropout_p: float = 0.0,
-    softmax_scale: float | None = None,
-    causal: bool = False,
-    window_size: tuple[int, int] = (-1, -1),
-    softcap: float | None = None,
-    alibi_slopes: torch.Tensor | None = None,
-    return_softmax: bool = False,
-    layout: str = "BSND",
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """NPU attention forward compatible with ring attention interface.
-
-    Args:
-        q: Query tensor of shape (batch, seq_len, num_heads, head_dim).
-        k: Key tensor of shape (batch, seq_len, num_heads, head_dim).
-        v: Value tensor of shape (batch, seq_len, num_heads, head_dim).
-        dropout_p: Dropout probability (ignored on NPU).
-        softmax_scale: Softmax scale factor.
-        causal: Causal attention flag (ignored on NPU, handled via pre_tokens/next_tokens).
-        window_size: Window size (ignored on NPU).
-        softcap: Soft cap value (ignored on NPU).
-        alibi_slopes: ALiBi slopes (ignored on NPU).
-        return_softmax: Return softmax flag (ignored on NPU).
-        layout: Input layout, default "BSND".
-
-    Returns:
-        tuple[torch.Tensor, torch.Tensor]: (output, lse).
-    """
-    assert HAS_NPU, "torch_npu is not available"
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
-    block_out, block_lse = torch_npu.npu_fused_infer_attention_score(
-        q,
-        k,
-        v,
-        num_heads=q.shape[-2],
-        input_layout=layout,
-        scale=softmax_scale,
-        softmax_lse_flag=True,
-        pre_tokens=65535,
-        next_tokens=65535,
-    )
-    return block_out, block_lse.squeeze(dim=-1)
