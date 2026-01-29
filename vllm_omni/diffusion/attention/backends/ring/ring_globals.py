@@ -15,7 +15,8 @@ except (ImportError, ModuleNotFoundError):
 # FA3 detection: try multiple sources (forward only, no backward needed for inference)
 # Source 1: flash_attn_interface (from flash-attention source build)
 # Source 2: fa3_fwd_interface (from fa3-fwd PyPI package, supports Ampere/Ada/Hopper)
-# Note: FA3 high-level API (flash_attn_func) always returns (out, softmax_lse) tuple
+# Note: FA3 high-level API may or may not return softmax_lse depending on version.
+#       For Ring Attention which requires LSE, we fall back to low-level API if needed.
 HAS_FA3 = False
 fa3_fwd_func = None  # Low-level forward function (_flash_attn_forward)
 fa3_attn_func = None  # High-level attention function (flash_attn_func)

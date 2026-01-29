@@ -11,7 +11,7 @@ from .ring_globals import (
     HAS_FA3,
     HAS_FLASH_ATTN,
     HAS_FLASHINFER,
-    fa3_attn_func,
+    fa3_fwd_func,
 )
 
 _scaled_dot_product_flash_attention = torch.ops.aten._scaled_dot_product_flash_attention
@@ -144,22 +144,24 @@ def fa3_forward(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap,
     """FA3 forward pass for inference.
 
     FA3 supports Ampere, Ada, and Hopper GPUs. Dropout is ignored since FA3 is inference-only.
-    FA3 high-level API always returns (out, softmax_lse) tuple.
+    Uses low-level API (_flash_attn_forward) which always returns softmax_lse,
+    required for Ring Attention's correct accumulation.
     """
     assert HAS_FA3, "FA3 is not available"
-    assert fa3_attn_func is not None, "FA3 high-level API (fa3_attn_func) not available"
+    assert fa3_fwd_func is not None, "FA3 low-level API (fa3_fwd_func) not available"
 
-    # FA3 high-level API always returns (out, softmax_lse)
-    # FA3 is inference-only, so we don't pass dropout_p (always 0 for inference)
-    out, softmax_lse = fa3_attn_func(
+    # Low-level API always returns (out, softmax_lse, S_dmask, rng_state)
+    out, softmax_lse, *_ = fa3_fwd_func(
         q,
         k,
         v,
         softmax_scale=softmax_scale,
         causal=causal,
-        window_size=window_size,
+        window_size_left=window_size[0] if window_size else -1,
+        window_size_right=window_size[1] if window_size else -1,
         softcap=softcap if softcap else 0.0,
     )
+
     return out, softmax_lse
 
 
