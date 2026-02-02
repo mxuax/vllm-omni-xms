@@ -91,12 +91,6 @@ class RingAttentionFunc(torch.autograd.Function):
         if sm_scale is None:
             sm_scale = q.shape[-1] ** -0.5
 
-        # Log ring attention execution (only once per forward pass to avoid spam)
-        logger.info_once(
-            f"RingAttention executing: rank={comm.rank}, world_size={comm.world_size}, "
-            f"q.shape={q.shape}, k.shape={k.shape}, v.shape={v.shape}"
-        )
-
         for step in range(comm.world_size):
             if step + 1 != comm.world_size:
                 next_k = comm.send_recv(k)
