@@ -75,10 +75,13 @@ class Attention(nn.Module):
                     sp_group = get_sp_group()
                     self.ring_pg = sp_group.ring_group
                     self.ring_runner = RingParallelAttention(sp_group)
-                except Exception:
+                    logger.info(f"Ring attention enabled: ring_degree={config.parallel_config.ring_degree}")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize Ring attention: {e}")
                     self.use_ring = False
                     self.ring_runner = None
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Forward context not available in Attention.__init__: {e}")
             self.use_ring = False
             self.ring_runner = None
 
