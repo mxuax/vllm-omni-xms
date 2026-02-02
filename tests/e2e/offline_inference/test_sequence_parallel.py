@@ -188,9 +188,15 @@ def test_sp_ring2_only(model_name: str, dtype: torch.dtype, attn_backend: str):
     """Test SP inference only (ring=2).
 
     This test validates that Ring attention is correctly executed by:
-    1. Running Ring SP inference (ring_degree=2)
-    2. Checking execution time to detect silent bypasses
-    3. Comparing outputs with baseline to ensure correctness
+    1. Running baseline inference first (for timing comparison)
+    2. Running Ring SP inference (ring_degree=2)
+    3. Checking speedup ratio to detect silent bypasses
+    4. Comparing outputs to ensure correctness
+
+    Expected behavior:
+    - Ring attention with 2 GPUs should provide some speedup (1.1x-2.0x)
+    - If speedup > 2.5x, Ring attention may have been bypassed
+    - Reference: Qwen/Qwen-Image with 1024x1024 shows ~1.3x speedup
     """
     if current_omni_platform.get_device_count() < 2:
         pytest.skip(f"Test requires 2 GPUs but only {current_omni_platform.get_device_count()} available")
@@ -198,6 +204,12 @@ def test_sp_ring2_only(model_name: str, dtype: torch.dtype, attn_backend: str):
     height = 256
     width = 256
     seed = 42
+
+    # Run baseline first for timing comparison
+    baseline_start = time.time()
+    baseline_images = _run_baseline(model_name, dtype, attn_backend, height, width, seed)
+    baseline_elapsed_ms = (time.time() - baseline_start) * 1000
+    assert baseline_images is not None and len(baseline_images) == 1
 
     # Run Ring SP inference with timing
     ring_images, ring_elapsed_ms = _run_sp(
@@ -209,20 +221,22 @@ def test_sp_ring2_only(model_name: str, dtype: torch.dtype, attn_backend: str):
     assert ring_images[0].width == width
     assert ring_images[0].height == height
 
-    print(f"\n[Ring SP] Execution time: {ring_elapsed_ms:.2f}ms")
+    # Calculate speedup ratio
+    speedup = baseline_elapsed_ms / ring_elapsed_ms if ring_elapsed_ms > 0 else float("inf")
 
-    # Execution time sanity check
-    # Ring attention with 2 GPUs should take significant time (>1000ms)
-    # If it's too fast (<500ms), it likely means Ring attention was bypassed
-    MIN_EXPECTED_TIME_MS = 500
-    if ring_elapsed_ms < MIN_EXPECTED_TIME_MS:
-        print(f"[WARNING] Ring SP execution time ({ring_elapsed_ms:.2f}ms) is suspiciously fast!")
-        print(f"[WARNING] Expected at least {MIN_EXPECTED_TIME_MS}ms for real Ring attention.")
+    print(f"\n[Baseline] Execution time: {baseline_elapsed_ms:.2f}ms")
+    print(f"[Ring SP] Execution time: {ring_elapsed_ms:.2f}ms")
+    print(f"[Speedup] {speedup:.2f}x")
+
+    # Speedup sanity check
+    # Ring attention with 2 GPUs should provide reasonable speedup (1.0x-2.0x)
+    # If speedup > 2.5x, it likely means Ring attention was bypassed
+    # (each GPU processes half sequence without proper Ring communication)
+    MAX_REASONABLE_SPEEDUP = 2.5
+    if speedup > MAX_REASONABLE_SPEEDUP:
+        print(f"[WARNING] Speedup ({speedup:.2f}x) is suspiciously high!")
+        print(f"[WARNING] Expected at most {MAX_REASONABLE_SPEEDUP}x for real Ring attention.")
         print("[WARNING] This may indicate Ring attention is not being executed correctly.")
-
-    # Run baseline for comparison
-    baseline_images = _run_baseline(model_name, dtype, attn_backend, height, width, seed)
-    assert baseline_images is not None and len(baseline_images) == 1
 
     # Validate Ring attention output matches baseline
     mean_abs_diff, max_abs_diff = _diff_metrics(baseline_images[0], ring_images[0])
