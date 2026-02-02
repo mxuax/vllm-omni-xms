@@ -175,7 +175,13 @@ def test_sp_ulysses2_only(model_name: str, dtype: torch.dtype, attn_backend: str
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("attn_backend", ["sdpa"])
 def test_sp_ring2_only(model_name: str, dtype: torch.dtype, attn_backend: str):
-    """Test SP inference only (ring=2)."""
+    """Test SP inference only (ring=2).
+
+    This test validates that Ring attention is correctly executed by:
+    1. Running baseline inference (no SP)
+    2. Running Ring SP inference (ring_degree=2)
+    3. Comparing outputs to ensure Ring attention produces correct results
+    """
     if current_omni_platform.get_device_count() < 2:
         pytest.skip(f"Test requires 2 GPUs but only {current_omni_platform.get_device_count()} available")
 
@@ -183,12 +189,29 @@ def test_sp_ring2_only(model_name: str, dtype: torch.dtype, attn_backend: str):
     width = 256
     seed = 42
 
-    images = _run_sp(model_name, dtype, attn_backend, height, width, seed, ulysses_degree=1, ring_degree=2)
+    # Run baseline first for comparison
+    baseline_images = _run_baseline(model_name, dtype, attn_backend, height, width, seed)
+    assert baseline_images is not None and len(baseline_images) == 1
 
-    assert images is not None
-    assert len(images) == 1
-    assert images[0].width == width
-    assert images[0].height == height
+    # Run Ring SP inference
+    ring_images = _run_sp(model_name, dtype, attn_backend, height, width, seed, ulysses_degree=1, ring_degree=2)
+
+    assert ring_images is not None
+    assert len(ring_images) == 1
+    assert ring_images[0].width == width
+    assert ring_images[0].height == height
+
+    # Validate Ring attention output matches baseline
+    # This ensures Ring attention was actually executed correctly
+    mean_abs_diff, max_abs_diff = _diff_metrics(baseline_images[0], ring_images[0])
+
+    mean_threshold = 2e-2
+    max_threshold = 2e-1
+
+    assert mean_abs_diff <= mean_threshold and max_abs_diff <= max_threshold, (
+        f"Ring SP output differs from baseline: mean={mean_abs_diff:.6e}, max={max_abs_diff:.6e}. "
+        f"This may indicate Ring attention was not correctly executed."
+    )
 
 
 @pytest.mark.parametrize("model_name", models)
