@@ -106,8 +106,13 @@ def _run_sp(
     seed: int,
     ulysses_degree: int,
     ring_degree: int,
+    return_elapsed_ms: bool = False,
 ):
-    """Run SP inference."""
+    """Run SP inference.
+
+    Args:
+        return_elapsed_ms: If True, return (images, elapsed_ms) tuple.
+    """
     sp_parallel_config = DiffusionParallelConfig(ulysses_degree=ulysses_degree, ring_degree=ring_degree)
     sp = Omni(
         model=model_name,
@@ -117,6 +122,7 @@ def _run_sp(
     )
 
     try:
+        start_time = time.time()
         outputs = sp.generate(
             PROMPT,
             OmniDiffusionSamplingParams(
@@ -128,7 +134,11 @@ def _run_sp(
                 num_outputs_per_prompt=1,
             ),
         )
-        return outputs[0].request_output[0].images
+        elapsed_ms = (time.time() - start_time) * 1000
+        images = outputs[0].request_output[0].images
+        if return_elapsed_ms:
+            return images, elapsed_ms
+        return images
     finally:
         sp.close()
         _cleanup_distributed()
@@ -178,9 +188,9 @@ def test_sp_ring2_only(model_name: str, dtype: torch.dtype, attn_backend: str):
     """Test SP inference only (ring=2).
 
     This test validates that Ring attention is correctly executed by:
-    1. Running baseline inference (no SP)
-    2. Running Ring SP inference (ring_degree=2)
-    3. Comparing outputs to ensure Ring attention produces correct results
+    1. Running Ring SP inference (ring_degree=2)
+    2. Checking execution time to detect silent bypasses
+    3. Comparing outputs with baseline to ensure correctness
     """
     if current_omni_platform.get_device_count() < 2:
         pytest.skip(f"Test requires 2 GPUs but only {current_omni_platform.get_device_count()} available")
@@ -189,24 +199,38 @@ def test_sp_ring2_only(model_name: str, dtype: torch.dtype, attn_backend: str):
     width = 256
     seed = 42
 
-    # Run baseline first for comparison
-    baseline_images = _run_baseline(model_name, dtype, attn_backend, height, width, seed)
-    assert baseline_images is not None and len(baseline_images) == 1
-
-    # Run Ring SP inference
-    ring_images = _run_sp(model_name, dtype, attn_backend, height, width, seed, ulysses_degree=1, ring_degree=2)
+    # Run Ring SP inference with timing
+    ring_images, ring_elapsed_ms = _run_sp(
+        model_name, dtype, attn_backend, height, width, seed, ulysses_degree=1, ring_degree=2, return_elapsed_ms=True
+    )
 
     assert ring_images is not None
     assert len(ring_images) == 1
     assert ring_images[0].width == width
     assert ring_images[0].height == height
 
+    print(f"\n[Ring SP] Execution time: {ring_elapsed_ms:.2f}ms")
+
+    # Execution time sanity check
+    # Ring attention with 2 GPUs should take significant time (>1000ms)
+    # If it's too fast (<500ms), it likely means Ring attention was bypassed
+    MIN_EXPECTED_TIME_MS = 500
+    if ring_elapsed_ms < MIN_EXPECTED_TIME_MS:
+        print(f"[WARNING] Ring SP execution time ({ring_elapsed_ms:.2f}ms) is suspiciously fast!")
+        print(f"[WARNING] Expected at least {MIN_EXPECTED_TIME_MS}ms for real Ring attention.")
+        print("[WARNING] This may indicate Ring attention is not being executed correctly.")
+
+    # Run baseline for comparison
+    baseline_images = _run_baseline(model_name, dtype, attn_backend, height, width, seed)
+    assert baseline_images is not None and len(baseline_images) == 1
+
     # Validate Ring attention output matches baseline
-    # This ensures Ring attention was actually executed correctly
     mean_abs_diff, max_abs_diff = _diff_metrics(baseline_images[0], ring_images[0])
 
     mean_threshold = 2e-2
     max_threshold = 2e-1
+
+    print(f"[Ring SP] Output diff vs baseline: mean={mean_abs_diff:.6e}, max={max_abs_diff:.6e}")
 
     assert mean_abs_diff <= mean_threshold and max_abs_diff <= max_threshold, (
         f"Ring SP output differs from baseline: mean={mean_abs_diff:.6e}, max={max_abs_diff:.6e}. "

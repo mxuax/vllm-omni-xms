@@ -7,10 +7,13 @@
 
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.ring.ring_kernels import pytorch_attn_forward
 from vllm_omni.diffusion.attention.backends.ring.ring_utils import update_out_and_lse
 from vllm_omni.diffusion.distributed.comm import RingComm
+
+logger = init_logger(__name__)
 
 
 def ring_pytorch_attn_func(
@@ -87,6 +90,12 @@ class RingAttentionFunc(torch.autograd.Function):
 
         if sm_scale is None:
             sm_scale = q.shape[-1] ** -0.5
+
+        # Debug: log ring attention execution
+        logger.debug(
+            f"RingAttention: rank={comm.rank}, world_size={comm.world_size}, "
+            f"q.shape={q.shape}, k.shape={k.shape}, v.shape={v.shape}"
+        )
 
         for step in range(comm.world_size):
             if step + 1 != comm.world_size:
