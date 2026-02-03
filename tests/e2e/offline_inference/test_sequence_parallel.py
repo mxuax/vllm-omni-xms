@@ -83,12 +83,12 @@ def _run_inference(
     height: int = DEFAULT_HEIGHT,
     width: int = DEFAULT_WIDTH,
     seed: int = DEFAULT_SEED,
-    num_runs: int = 1,
+    warmup: bool = True,
 ) -> InferenceResult:
     """Run inference with specified configuration.
 
     Args:
-        num_runs: Total runs including warmup. Last run is timed.
+        warmup: If True, run one warmup iteration before the timed run.
     """
     parallel_config = DiffusionParallelConfig(ulysses_degree=ulysses_degree, ring_degree=ring_degree)
     omni = Omni(
@@ -99,8 +99,8 @@ def _run_inference(
     )
 
     try:
-        # Warmup runs (not timed)
-        for i in range(num_runs - 1):
+        # Warmup run (not timed)
+        if warmup:
             _ = omni.generate(
                 PROMPT,
                 OmniDiffusionSamplingParams(
@@ -108,7 +108,7 @@ def _run_inference(
                     width=width,
                     num_inference_steps=DEFAULT_STEPS,
                     guidance_scale=0.0,
-                    generator=torch.Generator(current_omni_platform.device_type).manual_seed(seed + i + 1000),
+                    generator=torch.Generator(current_omni_platform.device_type).manual_seed(seed + 1000),
                     num_outputs_per_prompt=1,
                 ),
             )
@@ -138,129 +138,96 @@ def _run_inference(
 
 
 # =============================================================================
-# Correctness Tests
+# Correctness & Performance Tests
 # =============================================================================
+
+# SP configurations: (ulysses_degree, ring_degree, height, width)
+SP_CONFIGS = [
+    (2, 1, DEFAULT_HEIGHT, DEFAULT_WIDTH),  # Ulysses (2 GPUs)
+    (1, 2, DEFAULT_HEIGHT, DEFAULT_WIDTH),  # Ring (2 GPUs)
+    (2, 2, DEFAULT_HEIGHT, DEFAULT_WIDTH),  # Hybrid (4 GPUs)
+    (4, 1, 272, 272),  # Ulysses-4 (4 GPUs, non-standard shape)
+]
+
+
+def _get_sp_mode(ulysses_degree: int, ring_degree: int) -> str:
+    """Get SP mode name for logging."""
+    if ulysses_degree > 1 and ring_degree == 1:
+        return f"ulysses-{ulysses_degree}"
+    elif ring_degree > 1 and ulysses_degree == 1:
+        return f"ring-{ring_degree}"
+    else:
+        return f"hybrid-{ulysses_degree}x{ring_degree}"
 
 
 @pytest.mark.parametrize("model_name", MODELS)
-@pytest.mark.parametrize(
-    "ulysses_degree,ring_degree",
-    [
-        (2, 1),  # Ulysses only
-        (1, 2),  # Ring only
-        (2, 2),  # Hybrid (requires 4 GPUs)
-    ],
-)
-def test_sp_correctness(model_name: str, ulysses_degree: int, ring_degree: int):
-    """Test that SP inference produces correct outputs compared to baseline."""
-    sp_size = ulysses_degree * ring_degree
-    if current_omni_platform.get_device_count() < sp_size:
-        pytest.skip(f"Requires {sp_size} GPUs, have {current_omni_platform.get_device_count()}")
+def test_sp_correctness(model_name: str):
+    """Test that SP inference produces correct outputs and measure performance.
 
-    # Run baseline
-    baseline = _run_inference(model_name, torch.bfloat16, "sdpa")
-    assert len(baseline.images) == 1
-
-    # Run SP
-    sp_result = _run_inference(
-        model_name,
-        torch.bfloat16,
-        "sdpa",
-        ulysses_degree=ulysses_degree,
-        ring_degree=ring_degree,
-    )
-    assert len(sp_result.images) == 1
-
-    # Compare outputs
-    mean_diff, max_diff = _diff_metrics(baseline.images[0], sp_result.images[0])
-    sp_mode = (
-        "ulysses"
-        if ulysses_degree > 1 and ring_degree == 1
-        else "ring"
-        if ring_degree > 1 and ulysses_degree == 1
-        else "hybrid"
-    )
-    print(f"\n[{sp_mode}] diff: mean={mean_diff:.6e}, max={max_diff:.6e}")
-
-    assert mean_diff <= DIFF_MEAN_THRESHOLD and max_diff <= DIFF_MAX_THRESHOLD, (
-        f"SP output differs from baseline: mean={mean_diff:.6e}, max={max_diff:.6e}"
-    )
-
-
-@pytest.mark.parametrize("model_name", MODELS)
-def test_sp_ulysses4(model_name: str):
-    """Test Ulysses SP with 4 GPUs."""
-    if current_omni_platform.get_device_count() < 4:
-        pytest.skip(f"Requires 4 GPUs, have {current_omni_platform.get_device_count()}")
-
-    baseline = _run_inference(model_name, torch.bfloat16, "sdpa", height=272, width=272)
-    sp_result = _run_inference(
-        model_name,
-        torch.bfloat16,
-        "sdpa",
-        ulysses_degree=4,
-        ring_degree=1,
-        height=272,
-        width=272,
-    )
-
-    mean_diff, max_diff = _diff_metrics(baseline.images[0], sp_result.images[0])
-    assert mean_diff <= DIFF_MEAN_THRESHOLD and max_diff <= DIFF_MAX_THRESHOLD
-
-
-# =============================================================================
-# Performance Test (with warmup)
-# =============================================================================
-
-
-@pytest.mark.parametrize("model_name", MODELS)
-def test_sp_performance(model_name: str):
-    """Performance comparison: Baseline vs Ulysses vs Ring (with warmup).
-
-    Runs 2 iterations per config (1 warmup + 1 timed) to exclude
-    NCCL initialization and JIT compilation overhead.
+    Runs baseline once per unique (height, width), then tests all SP configs.
     """
-    if current_omni_platform.get_device_count() < 2:
-        pytest.skip(f"Requires 2 GPUs, have {current_omni_platform.get_device_count()}")
+    device_count = current_omni_platform.get_device_count()
 
-    num_runs = 2  # 1 warmup + 1 timed
+    # Cache baseline results by (height, width)
+    baseline_cache: dict[tuple[int, int], InferenceResult] = {}
 
-    print("\n" + "=" * 60)
-    print("SP Performance (warmup=1)")
-    print("=" * 60)
+    # Collect results for summary
+    results: list[tuple[str, int, float, float, float, float]] = []
 
-    # Baseline
-    baseline = _run_inference(model_name, torch.bfloat16, "sdpa", num_runs=num_runs)
-    print(f"[Baseline]  1 GPU:  {baseline.elapsed_ms:.0f}ms")
+    for ulysses_degree, ring_degree, height, width in SP_CONFIGS:
+        sp_size = ulysses_degree * ring_degree
+        sp_mode = _get_sp_mode(ulysses_degree, ring_degree)
 
-    # Ulysses
-    ulysses = _run_inference(
-        model_name,
-        torch.bfloat16,
-        "sdpa",
-        ulysses_degree=2,
-        ring_degree=1,
-        num_runs=num_runs,
-    )
-    ulysses_speedup = baseline.elapsed_ms / ulysses.elapsed_ms if ulysses.elapsed_ms > 0 else 0
-    print(f"[Ulysses]   2 GPUs: {ulysses.elapsed_ms:.0f}ms ({ulysses_speedup:.2f}x)")
+        if device_count < sp_size:
+            print(f"\n[{sp_mode}] SKIPPED (requires {sp_size} GPUs, have {device_count})")
+            continue
 
-    # Ring
-    ring = _run_inference(
-        model_name,
-        torch.bfloat16,
-        "sdpa",
-        ulysses_degree=1,
-        ring_degree=2,
-        num_runs=num_runs,
-    )
-    ring_speedup = baseline.elapsed_ms / ring.elapsed_ms if ring.elapsed_ms > 0 else 0
-    print(f"[Ring]      2 GPUs: {ring.elapsed_ms:.0f}ms ({ring_speedup:.2f}x)")
+        # Get or compute baseline for this (height, width)
+        cache_key = (height, width)
+        if cache_key not in baseline_cache:
+            baseline = _run_inference(model_name, torch.bfloat16, "sdpa", height=height, width=width)
+            assert len(baseline.images) == 1
+            baseline_cache[cache_key] = baseline
+            print(f"\n[baseline] {height}x{width}: {baseline.elapsed_ms:.0f}ms")
+        else:
+            baseline = baseline_cache[cache_key]
 
-    print("=" * 60)
+        # Run SP
+        sp_result = _run_inference(
+            model_name,
+            torch.bfloat16,
+            "sdpa",
+            ulysses_degree=ulysses_degree,
+            ring_degree=ring_degree,
+            height=height,
+            width=width,
+        )
+        assert len(sp_result.images) == 1
 
-    # Verify correctness
-    for name, result in [("Ulysses", ulysses), ("Ring", ring)]:
-        mean_diff, max_diff = _diff_metrics(baseline.images[0], result.images[0])
-        print(f"[{name}] diff: mean={mean_diff:.6e}, max={max_diff:.6e}")
-        assert mean_diff <= DIFF_MEAN_THRESHOLD and max_diff <= DIFF_MAX_THRESHOLD
+        # Compare outputs (correctness)
+        mean_diff, max_diff = _diff_metrics(baseline.images[0], sp_result.images[0])
+
+        # Performance metrics
+        speedup = baseline.elapsed_ms / sp_result.elapsed_ms if sp_result.elapsed_ms > 0 else 0
+
+        print(
+            f"[{sp_mode}] {sp_size} GPUs | "
+            f"sp: {sp_result.elapsed_ms:.0f}ms, speedup: {speedup:.2f}x | "
+            f"diff: mean={mean_diff:.6e}, max={max_diff:.6e}"
+        )
+
+        # Store results for final assertion
+        results.append((sp_mode, sp_size, speedup, mean_diff, max_diff, sp_result.elapsed_ms))
+
+        # Assert correctness
+        assert mean_diff <= DIFF_MEAN_THRESHOLD and max_diff <= DIFF_MAX_THRESHOLD, (
+            f"[{sp_mode}] SP output differs from baseline: mean={mean_diff:.6e}, max={max_diff:.6e}"
+        )
+
+    # Summary
+    if results:
+        print("\n" + "=" * 60)
+        print("Summary:")
+        for sp_mode, sp_size, speedup, mean_diff, max_diff, elapsed_ms in results:
+            print(f"  [{sp_mode}] {sp_size} GPUs: {elapsed_ms:.0f}ms ({speedup:.2f}x)")
+        print("=" * 60)
