@@ -145,10 +145,10 @@ def _run_inference(
 # - warmup: whether to run warmup for this SP config
 # - is_perf_test: whether this is a performance test (show speedup metrics)
 SP_CONFIGS = [
-    (2, 1, DEFAULT_HEIGHT, DEFAULT_WIDTH, True, True),  # Ulysses - performance test
-    (1, 2, DEFAULT_HEIGHT, DEFAULT_WIDTH, True, True),  # Ring - performance test
+    (2, 1, DEFAULT_HEIGHT, DEFAULT_WIDTH, True, True),  # Ulysses-2 - performance test
+    (1, 2, DEFAULT_HEIGHT, DEFAULT_WIDTH, True, True),  # Ring-2 - performance test
     (2, 2, DEFAULT_HEIGHT, DEFAULT_WIDTH, False, False),  # Hybrid - correctness only
-    (4, 1, 272, 272, False, False),  # Ulysses-4 - shape test only
+    (4, 1, 272, 272, False, False),  # Ulysses-4 - shape and correctness
 ]
 
 
