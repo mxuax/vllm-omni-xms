@@ -203,6 +203,52 @@ class WanTimeTextImageEmbedding(nn.Module):
         return temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image
 
 
+class TimestepProjPrepare(nn.Module):
+    """Prepares timestep_proj for sequence parallel in TI2V models.
+
+    This module encapsulates the unflatten operation for timestep_proj, which is used
+    to reshape the projection into [batch, seq_len, 6, inner_dim] format for TI2V models.
+
+    Similar to Z-Image's UnifiedPrepare and Qwen's ModulateIndexPrepare, this creates
+    a module boundary where _sp_plan can shard the output via split_output=True.
+
+    The timestep_proj sequence dimension must be sharded to match the sharded
+    hidden_states in SP mode.
+
+    Note: Our _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism).
+    """
+
+    def forward(
+        self,
+        timestep_proj: torch.Tensor,
+        ts_seq_len: int | None,
+    ) -> torch.Tensor:
+        """Prepare timestep_proj for SP by applying unflatten.
+
+        Args:
+            timestep_proj: Timestep projection tensor from condition_embedder
+                - If ts_seq_len is not None: [batch, seq_len, proj_dim]
+                - If ts_seq_len is None: [batch, proj_dim]
+            ts_seq_len: Sequence length for TI2V models, None for T2V models
+
+        Returns:
+            timestep_proj: Reshaped tensor
+                - If ts_seq_len is not None: [batch, seq_len, 6, inner_dim] (TI2V)
+                - If ts_seq_len is None: [batch, 6, inner_dim] (T2V)
+
+        Note: _sp_plan will shard timestep_proj via split_output=True when SP is enabled
+              and ts_seq_len is not None (TI2V mode).
+              The timestep_proj sequence dimension must match hidden_states after sharding.
+        """
+        if ts_seq_len is not None:
+            # TI2V mode: reshape to [batch, seq_len, 6, inner_dim]
+            timestep_proj = timestep_proj.unflatten(2, (6, -1))
+        else:
+            # T2V mode: reshape to [batch, 6, inner_dim]
+            timestep_proj = timestep_proj.unflatten(1, (6, -1))
+        return timestep_proj
+
+
 class WanSelfAttention(nn.Module):
     """
     Optimized self-attention module using vLLM layers.
@@ -540,6 +586,7 @@ class WanTransformer3DModel(nn.Module):
     #
     # The _sp_plan specifies sharding/gathering at module boundaries:
     # - rope: Split both RoPE outputs (freqs_cos, freqs_sin) via split_output=True
+    # - timestep_proj_prepare: Split timestep_proj for TI2V models (4D tensor)
     # - blocks.0: Split hidden_states input at the first transformer block
     # - proj_out: Gather outputs after the final projection layer
     #
@@ -549,6 +596,12 @@ class WanTransformer3DModel(nn.Module):
         "rope": {
             0: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),  # freqs_cos [1, seq, 1, dim]
             1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),  # freqs_sin [1, seq, 1, dim]
+        },
+        # Shard timestep_proj for TI2V models (4D tensor: [batch, seq_len, 6, inner_dim])
+        # This is only active when ts_seq_len is not None (TI2V mode)
+        # Output is a single tensor, shard along dim=1 (sequence dimension)
+        "timestep_proj_prepare": {
+            0: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),  # [B, seq, 6, dim]
         },
         # Shard hidden_states at first transformer block input
         # (after patch_embedding + flatten + transpose)
@@ -637,6 +690,10 @@ class WanTransformer3DModel(nn.Module):
         self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
         self.scale_shift_table = nn.Parameter(torch.randn(1, 2, inner_dim) / inner_dim**0.5)
 
+        # TimestepProjPrepare module for _sp_plan to shard timestep_proj (TI2V models)
+        # This ensures timestep_proj sequence dimension matches sharded hidden_states
+        self.timestep_proj_prepare = TimestepProjPrepare()
+
     @property
     def dtype(self) -> torch.dtype:
         """Return the dtype of the model parameters."""
@@ -675,10 +732,10 @@ class WanTransformer3DModel(nn.Module):
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
             timestep, encoder_hidden_states, encoder_hidden_states_image, timestep_seq_len=ts_seq_len
         )
-        if ts_seq_len is not None:
-            timestep_proj = timestep_proj.unflatten(2, (6, -1))
-        else:
-            timestep_proj = timestep_proj.unflatten(1, (6, -1))
+        # Prepare timestep_proj via TimestepProjPrepare module
+        # _sp_plan will shard timestep_proj via split_output=True (when ts_seq_len is not None)
+        # This ensures timestep_proj sequence dimension matches sharded hidden_states
+        timestep_proj = self.timestep_proj_prepare(timestep_proj, ts_seq_len)
 
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
