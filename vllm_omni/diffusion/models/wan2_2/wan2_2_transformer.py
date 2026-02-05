@@ -204,16 +204,65 @@ class WanTimeTextImageEmbedding(nn.Module):
 
 
 class TimestepProjPrepare(nn.Module):
+    """Prepares timestep_proj for sequence parallel in TI2V models.
+
+    Encapsulates the unflatten operation for timestep_proj to enable _sp_plan sharding.
+    """
+
     def forward(
         self,
         timestep_proj: torch.Tensor,
         ts_seq_len: int | None,
     ) -> torch.Tensor:
         if ts_seq_len is not None:
+            # TI2V mode: [batch, seq_len, 6, inner_dim]
             timestep_proj = timestep_proj.unflatten(2, (6, -1))
         else:
+            # T2V mode: [batch, 6, inner_dim]
             timestep_proj = timestep_proj.unflatten(1, (6, -1))
         return timestep_proj
+
+
+class OutputScaleShiftPrepare(nn.Module):
+    """Prepares output scale/shift for sequence parallel in TI2V models.
+
+    Encapsulates the scale_shift_table computation for output norm to enable _sp_plan sharding.
+    In TI2V mode, temb has shape [batch, seq_len, inner_dim] and scale/shift need to be
+    sharded along seq_len to match the sharded hidden_states.
+
+    Note: Our _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism).
+    """
+
+    def __init__(self, inner_dim: int):
+        super().__init__()
+        self.scale_shift_table = nn.Parameter(torch.randn(1, 2, inner_dim) / inner_dim**0.5)
+
+    def forward(
+        self,
+        temb: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute output scale/shift for SP.
+
+        Args:
+            temb: Time embedding tensor
+                - TI2V mode: [batch, seq_len, inner_dim] (3D)
+                - T2V mode: [batch, inner_dim] (2D)
+
+        Returns:
+            shift: Shift tensor, sharded if TI2V mode
+            scale: Scale tensor, sharded if TI2V mode
+
+        Note: _sp_plan will shard outputs via split_output=True when temb.ndim == 3 (TI2V mode).
+        """
+        if temb.ndim == 3:
+            # TI2V mode: scale/shift have seq_len dimension
+            shift, scale = (self.scale_shift_table.unsqueeze(0).to(temb.device) + temb.unsqueeze(2)).chunk(2, dim=2)
+            shift = shift.squeeze(2)  # [batch, seq_len, inner_dim]
+            scale = scale.squeeze(2)  # [batch, seq_len, inner_dim]
+        else:
+            # T2V mode: scale/shift are broadcast-able (no seq_len dimension)
+            shift, scale = (self.scale_shift_table.to(temb.device) + temb.unsqueeze(1)).chunk(2, dim=1)
+        return shift, scale
 
 
 class WanSelfAttention(nn.Module):
@@ -575,6 +624,12 @@ class WanTransformer3DModel(nn.Module):
         "blocks.0": {
             "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3),  # [B, seq, dim]
         },
+        # Shard output scale/shift for TI2V models (3D tensor: [batch, seq_len, inner_dim])
+        # Only shards when temb.ndim == 3 (TI2V mode); T2V mode outputs are 2D and broadcast-able
+        "output_scale_shift_prepare": {
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),  # shift [B, seq, dim]
+            1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),  # scale [B, seq, dim]
+        },
         # Gather at proj_out (final linear projection before unpatchify)
         "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
@@ -655,11 +710,14 @@ class WanTransformer3DModel(nn.Module):
         # 4. Output norm & projection
         self.norm_out = FP32LayerNorm(inner_dim, eps, elementwise_affine=False)
         self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
-        self.scale_shift_table = nn.Parameter(torch.randn(1, 2, inner_dim) / inner_dim**0.5)
 
         # TimestepProjPrepare module for _sp_plan to shard timestep_proj (TI2V models)
         # This ensures timestep_proj sequence dimension matches sharded hidden_states
         self.timestep_proj_prepare = TimestepProjPrepare()
+
+        # OutputScaleShiftPrepare module for _sp_plan to shard output scale/shift (TI2V models)
+        # This ensures scale/shift sequence dimension matches sharded hidden_states
+        self.output_scale_shift_prepare = OutputScaleShiftPrepare(inner_dim)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -712,12 +770,10 @@ class WanTransformer3DModel(nn.Module):
             hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
 
         # Output norm, projection & unpatchify
-        if temb.ndim == 3:
-            shift, scale = (self.scale_shift_table.unsqueeze(0).to(temb.device) + temb.unsqueeze(2)).chunk(2, dim=2)
-            shift = shift.squeeze(2)
-            scale = scale.squeeze(2)
-        else:
-            shift, scale = (self.scale_shift_table.to(temb.device) + temb.unsqueeze(1)).chunk(2, dim=1)
+        # Prepare output scale/shift via OutputScaleShiftPrepare module
+        # _sp_plan will shard shift/scale via split_output=True (when temb.ndim == 3, TI2V mode)
+        # This ensures scale/shift sequence dimension matches sharded hidden_states
+        shift, scale = self.output_scale_shift_prepare(temb)
 
         shift = shift.to(hidden_states.device)
         scale = scale.to(hidden_states.device)
@@ -759,10 +815,20 @@ class WanTransformer3DModel(nn.Module):
             (".attn1.to_qkv", ".attn1.to_v", "v"),
         ]
 
+        # Weight name remapping for restructured modules
+        # Maps pretrained weight names to our module structure
+        weight_name_remapping = {
+            "scale_shift_table": "output_scale_shift_prepare.scale_shift_table",
+        }
+
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
+            # Apply weight name remapping
+            if name in weight_name_remapping:
+                name = weight_name_remapping[name]
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
