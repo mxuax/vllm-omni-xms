@@ -255,13 +255,17 @@ class OutputScaleShiftPrepare(nn.Module):
         Note: _sp_plan will shard outputs via split_output=True when temb.ndim == 3 (TI2V mode).
         """
         if temb.ndim == 3:
-            # TI2V mode: scale/shift have seq_len dimension
+            # TI2V mode: scale/shift have seq_len dimension [batch, seq_len, inner_dim]
+            # _sp_plan will shard these 3D outputs along dim=1
             shift, scale = (self.scale_shift_table.unsqueeze(0).to(temb.device) + temb.unsqueeze(2)).chunk(2, dim=2)
             shift = shift.squeeze(2)  # [batch, seq_len, inner_dim]
             scale = scale.squeeze(2)  # [batch, seq_len, inner_dim]
         else:
             # T2V mode: scale/shift are broadcast-able (no seq_len dimension)
+            # Return 2D tensors so _sp_plan (expected_dims=3) will skip sharding
             shift, scale = (self.scale_shift_table.to(temb.device) + temb.unsqueeze(1)).chunk(2, dim=1)
+            shift = shift.squeeze(1)  # [batch, inner_dim]
+            scale = scale.squeeze(1)  # [batch, inner_dim]
         return shift, scale
 
 
@@ -777,6 +781,12 @@ class WanTransformer3DModel(nn.Module):
 
         shift = shift.to(hidden_states.device)
         scale = scale.to(hidden_states.device)
+
+        # T2V mode returns 2D tensors [batch, inner_dim], need unsqueeze for broadcast
+        # TI2V mode returns 3D tensors [batch, seq_len, inner_dim], already compatible
+        if shift.ndim == 2:
+            shift = shift.unsqueeze(1)  # [batch, 1, inner_dim]
+            scale = scale.unsqueeze(1)  # [batch, 1, inner_dim]
 
         hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
         hidden_states = self.proj_out(hidden_states)
