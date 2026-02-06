@@ -63,11 +63,9 @@ def sp_shard(
             f"world_size ({world_size}) for sequence parallel sharding."
         )
 
-    # Ensure tensor is large enough to shard
     if size < world_size:
         raise ValueError(
-            f"Tensor size along dim {dim} ({size}) must be >= world_size ({world_size}) "
-            f"for sequence parallel sharding. Tensor shape: {tensor.shape}"
+            f"Tensor size along dim {dim} ({size}) must be >= world_size ({world_size}). Tensor shape: {tensor.shape}"
         )
 
     return tensor.chunk(world_size, dim=dim)[rank]
