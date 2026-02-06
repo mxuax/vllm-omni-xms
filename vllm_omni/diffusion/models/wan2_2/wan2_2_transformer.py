@@ -204,14 +204,21 @@ class WanTimeTextImageEmbedding(nn.Module):
 
 
 class TimestepProjPrepare(nn.Module):
+    """Prepares timestep_proj for sequence parallel in TI2V models.
+
+    Encapsulates the unflatten operation for timestep_proj to enable _sp_plan sharding.
+    """
+
     def forward(
         self,
         timestep_proj: torch.Tensor,
         ts_seq_len: int | None,
     ) -> torch.Tensor:
         if ts_seq_len is not None:
+            # TI2V mode: [batch, seq_len, 6, inner_dim]
             timestep_proj = timestep_proj.unflatten(2, (6, -1))
         else:
+            # T2V mode: [batch, 6, inner_dim]
             timestep_proj = timestep_proj.unflatten(1, (6, -1))
         return timestep_proj
 
