@@ -66,6 +66,11 @@ def sp_shard(
             f"Hint: adjust height/width/num_frames to make sequence length divisible by SP world_size."
         )
 
+    if size < world_size:
+        raise ValueError(
+            f"Tensor size along dim {dim} ({size}) must be >= world_size ({world_size}). Tensor shape: {tensor.shape}"
+        )
+
     return tensor.chunk(world_size, dim=dim)[rank]
 
 
