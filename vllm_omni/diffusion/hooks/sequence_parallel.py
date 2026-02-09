@@ -455,6 +455,8 @@ class SequenceParallelGatherHook(ModelHook):
             ctx = get_forward_context()
             original_seq_len = ctx.sp_original_seq_len
 
+        actually_gathered = False
+
         for i, spm in enumerate(self.metadata):
             if spm is None:
                 continue
@@ -475,9 +477,10 @@ class SequenceParallelGatherHook(ModelHook):
                 logger.debug(f"Removed padding: gathered shape {gathered.shape} (original_seq_len={original_seq_len})")
 
             output[i] = gathered
+            actually_gathered = True
 
-        # Mark SP as inactive after gather completes
-        if is_forward_context_available():
+        # Mark SP as inactive only if at least one tensor was actually gathered
+        if actually_gathered and is_forward_context_available():
             ctx = get_forward_context()
             ctx._sp_shard_depth = max(0, ctx._sp_shard_depth - 1)
 
