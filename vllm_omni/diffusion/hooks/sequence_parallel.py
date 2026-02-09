@@ -235,6 +235,8 @@ class SequenceParallelSplitHook(ModelHook):
 
     def post_forward(self, module: nn.Module, output: Any) -> Any:
         """Shard outputs for split_output=True entries."""
+        from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
         is_tensor = isinstance(output, torch.Tensor)
         is_tensor_list = isinstance(output, (list, tuple)) and all(isinstance(x, torch.Tensor) for x in output)
 
@@ -253,6 +255,10 @@ class SequenceParallelSplitHook(ModelHook):
                 raise ValueError(f"Index {index} out of bounds for output of length {len(output_list)}.")
 
             output_list[index] = self._prepare_sp_input(output_list[index], spm, self._last_args, self._last_kwargs)
+
+        # Mark SP as active after sharding completes
+        if is_forward_context_available():
+            get_forward_context()._sp_shard_depth += 1
 
         return output_list[0] if is_tensor else type(output)(output_list)
 
@@ -465,6 +471,11 @@ class SequenceParallelGatherHook(ModelHook):
                 logger.debug(f"Removed padding: gathered shape {gathered.shape} (original_seq_len={original_seq_len})")
 
             output[i] = gathered
+
+        # Mark SP as inactive after gather completes
+        if is_forward_context_available():
+            ctx = get_forward_context()
+            ctx._sp_shard_depth = max(0, ctx._sp_shard_depth - 1)
 
         return output[0] if is_tensor else type(output)(output)
 
