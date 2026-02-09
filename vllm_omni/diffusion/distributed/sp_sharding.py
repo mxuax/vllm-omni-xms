@@ -57,10 +57,13 @@ def sp_shard(
     rank = get_sequence_parallel_rank()
     size = tensor.size(dim)
 
-    if validate and size % world_size != 0:
+    # Always check divisibility - uneven chunks cause gather corruption
+    if size % world_size != 0:
         raise ValueError(
             f"Tensor size along dim {dim} ({size}) must be divisible by "
-            f"world_size ({world_size}) for sequence parallel sharding."
+            f"world_size ({world_size}) for sequence parallel sharding. "
+            f"Tensor shape: {tensor.shape}. "
+            f"Hint: adjust height/width/num_frames to make sequence length divisible by SP world_size."
         )
 
     return tensor.chunk(world_size, dim=dim)[rank]
